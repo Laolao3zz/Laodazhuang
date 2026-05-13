@@ -1,0 +1,8 @@
+{
+  "name": "LaoDaZhuang Fitness",
+  "description": "A comprehensive fitness tracking application with custom workout plans, history logging, and data visualization.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": []
+}
