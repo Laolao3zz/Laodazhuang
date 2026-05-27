@@ -8,7 +8,7 @@ import {
   TrendingUp, TrendingDown, Info, Repeat, AlertTriangle, Trophy, Target, PieChart, PlusCircle, Scale,
   MoreVertical, Hammer, LayoutGrid, LineChart, Hourglass, Gift, Heart, Sparkles, Moon, Sun, Sunrise,
   BarChart4, Minus, Footprints, History, Coffee, Ghost, Play, Pause, RotateCcw,
-  CalendarCheck, MapPin, RefreshCw, Link2, ArrowDown, Mountain
+  CalendarCheck, MapPin, RefreshCw, Link2, Mountain
 } from 'lucide-react';
 import { MAIN_PLANS_DEFAULT } from './constants';
 import { Plan, HistoryItemType, ExerciseHistoryRecord, BodyStat, WorkoutSetLog, ChartDataPoint, Exercise, RewardRecord } from './types';
@@ -484,9 +484,46 @@ export default function App() {
     }
 
     const savedPlans = localStorage.getItem('fitness_plans_v8');
-    if (savedPlans) { const parsedPlans = superParse(savedPlans, null); if (parsedPlans) setPlans(parsedPlans); else { setPlans(MAIN_PLANS_DEFAULT); localStorage.setItem('fitness_plans_v8', JSON.stringify(MAIN_PLANS_DEFAULT)); } } 
+    if (savedPlans) { const parsedPlans = superParse(savedPlans, null); if (parsedPlans) setPlans(parsedPlans); else { setPlans(MAIN_PLANS_DEFAULT); localStorage.setItem('fitness_plans_v8', JSON.stringify(MAIN_PLANS_DEFAULT)); } }
     else { setPlans(MAIN_PLANS_DEFAULT); setCurrentPlanIndex(0); localStorage.setItem('fitness_plans_v8', JSON.stringify(MAIN_PLANS_DEFAULT)); localStorage.setItem('fitness_plan_index_v6', '0'); }
+
+    // 状态保活：恢复进行中的训练（如果 PWA 被切后台杀掉重启）
+    try {
+      const savedActive = localStorage.getItem('fitness_active_workout_v1');
+      if (savedActive) {
+        const parsed = JSON.parse(savedActive);
+        if (parsed && parsed.activeWorkout && parsed.workoutStartTime) {
+          // 超过 6 小时没动的训练视为废弃，自动清理
+          const ageHours = (Date.now() - parsed.workoutStartTime) / 3600000;
+          if (ageHours < 6) {
+            setActiveWorkout(parsed.activeWorkout);
+            setWorkoutLogs(parsed.workoutLogs || {});
+            setWorkoutStartTime(parsed.workoutStartTime);
+            setExpandedExId(parsed.expandedExId || null);
+            setActiveTab('workout');
+          } else {
+            localStorage.removeItem('fitness_active_workout_v1');
+          }
+        }
+      }
+    } catch (e) { localStorage.removeItem('fitness_active_workout_v1'); }
   }, []);
+
+  // 状态保活：训练状态变化时自动写盘
+  useEffect(() => {
+    if (activeWorkout && workoutStartTime) {
+      try {
+        localStorage.setItem('fitness_active_workout_v1', JSON.stringify({
+          activeWorkout,
+          workoutLogs,
+          workoutStartTime,
+          expandedExId,
+        }));
+      } catch (e) { /* 配额满了忽略，下次再试 */ }
+    } else {
+      localStorage.removeItem('fitness_active_workout_v1');
+    }
+  }, [activeWorkout, workoutLogs, workoutStartTime, expandedExId]);
 
   const saveToLocal = (key: string, data: any) => { try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { alert("存储空间不足"); } };
   const startRestTimer = (seconds = 90) => { setRestTimer(seconds); setIsResting(true); };
@@ -545,21 +582,6 @@ export default function App() {
   const deleteSet = (exId: string, idx: number) => {
     const newLogs = { ...workoutLogs };
     if (newLogs[exId] && newLogs[exId].length > 1) { newLogs[exId] = newLogs[exId].filter((_, i) => i !== idx); setWorkoutLogs(newLogs); }
-  };
-
-  // D2: 把上一组的 weight/reps 复制到当前组
-  const copyFromPrevious = (exId: string, idx: number) => {
-    if (idx === 0) return;
-    const newLogs = { ...workoutLogs };
-    if (newLogs[exId]) {
-      const sets = [...newLogs[exId]];
-      const prev = sets[idx - 1];
-      if (!prev) return;
-      sets[idx] = { ...sets[idx], weight: prev.weight, reps: prev.reps };
-      newLogs[exId] = sets;
-      setWorkoutLogs(newLogs);
-      haptics.light();
-    }
   };
 
   const confirmFinishWorkout = () => {
@@ -641,10 +663,15 @@ export default function App() {
 
   const saveCardioLog = () => {
       if (!cardioData.duration) { alert("请至少填写持续时间"); return; }
-      const date = cardioData.date || getLocalDateString();
+      const today = getLocalDateString();
+      const date = cardioData.date || today;
+      // 修复时间戳：今天用当前时刻，补录历史用那天的 23:59 避免被同日记录顶下去
+      const ts = date === today
+        ? Date.now()
+        : new Date(`${date}T23:59:00`).getTime();
       const newEntry: HistoryItemType = {
         date,
-        timestamp: new Date(date).getTime() + 1000,
+        timestamp: ts,
         type: 'cardio',
         planName: '爬坡',
         metrics: {
@@ -1240,16 +1267,6 @@ export default function App() {
                           <div className="w-12 flex items-center justify-center gap-1">
                             {logs.length > 1 ? (<button onClick={() => deleteSet(ex.id, idx)} className="text-slate-200 hover:text-red-500 p-1"><X size={12}/></button>) : <span className="w-4"></span>}
                             <span className={`font-bold text-sm w-3 text-center ${showPR ? 'text-yellow-600' : 'text-slate-300'}`}>{idx + 1}</span>
-                            {idx > 0 && !set.completed && (
-                              <button
-                                type="button"
-                                onClick={() => copyFromPrevious(ex.id, idx)}
-                                title="同上一组"
-                                className="text-slate-300 hover:text-orange-500 p-1 active:scale-90 transition-all"
-                              >
-                                <ArrowDown size={12}/>
-                              </button>
-                            )}
                           </div>
                           <SmartInput placeholder={ex.unit === 'reps_only' ? '-' : (lastRecord?.weight || '0')} value={set.weight} onChange={(v) => updateSet(ex.id, idx, 'weight', v)} step={ex.unit === 'time' ? 1 : 2.5} disabled={ex.unit === 'reps_only'} />
                           <SmartInput placeholder={ex.defaultReps} value={set.reps} onChange={(v) => updateSet(ex.id, idx, 'reps', v)} disabled={isRelaxation && ex.unit === 'time'} />
