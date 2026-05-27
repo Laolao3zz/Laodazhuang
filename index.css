@@ -2,7 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Lock body to prevent scrolling and rubber-banding */
+/* ===== iOS PWA 体感打底 ===== */
 html, body {
   height: 100%;
   width: 100%;
@@ -10,12 +10,36 @@ html, body {
   overscroll-behavior: none;
   -webkit-overflow-scrolling: touch;
   position: fixed;
+  /* 字体栈交给 Tailwind font-sans，但 body 缺省也保险一份 */
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* iOS 长按禁出系统菜单（输入区域单独放开） */
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
 }
+
 #root {
   height: 100%;
   width: 100%;
   overflow: hidden;
 }
+
+/* 输入控件保留可选+长按菜单，避免影响打字 */
+input, textarea, [contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+/* 关掉 number input 的小箭头（iOS 没影响，桌面端也清爽） */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] { -moz-appearance: textfield; }
 
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
@@ -31,4 +55,14 @@ html, body {
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* PR 高亮（阶段 2 会用到，先把动画占位放进来不影响阶段 1） */
+@keyframes prFlash {
+  0% { background-color: rgba(250, 204, 21, 0); }
+  30% { background-color: rgba(250, 204, 21, 0.35); }
+  100% { background-color: rgba(250, 204, 21, 0); }
+}
+.animate-pr-flash {
+  animation: prFlash 1.2s ease-out;
 }

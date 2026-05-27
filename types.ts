@@ -30,16 +30,23 @@ export interface WorkoutMetrics {
   note?: string;
   activeCalories?: string;
   avgHeartRate?: string;
+  // 爬坡专属字段
+  incline?: string;   // 坡度 %
+  speed?: string;     // 速度 km/h
+  distance?: string;  // 距离 km
 }
 
 export interface HistoryItemType {
   date: string;
   timestamp: number;
-  type: 'workout' | 'rest' | 'lazy';
+  /** 'cardio' = 独立有氧（仅爬坡）；'workout' = 力量训练；rest/lazy = 休息 */
+  type: 'workout' | 'cardio' | 'rest' | 'lazy';
   planName?: string;
   logs?: Record<string, WorkoutSetLog[]>;
   metrics?: WorkoutMetrics;
   note?: string;
+  /** 关联的力量训练记录 timestamp（如果有氧是接在力量后面做的） */
+  linkedWorkoutTs?: number;
 }
 
 export interface BodyStat {

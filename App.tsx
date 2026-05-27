@@ -8,7 +8,7 @@ import {
   TrendingUp, TrendingDown, Info, Repeat, AlertTriangle, Trophy, Target, PieChart, PlusCircle, Scale,
   MoreVertical, Hammer, LayoutGrid, LineChart, Hourglass, Gift, Heart, Sparkles, Moon, Sun, Sunrise,
   BarChart4, Minus, Footprints, History, Coffee, Ghost, Play, Pause, RotateCcw,
-  CalendarCheck, MapPin, RefreshCw, Link2
+  CalendarCheck, MapPin, RefreshCw, Link2, ArrowDown, Mountain
 } from 'lucide-react';
 import { MAIN_PLANS_DEFAULT } from './constants';
 import { Plan, HistoryItemType, ExerciseHistoryRecord, BodyStat, WorkoutSetLog, ChartDataPoint, Exercise, RewardRecord } from './types';
@@ -17,6 +17,8 @@ import SmartInput from './components/SmartInput';
 import SimpleLineChart from './components/SimpleLineChart';
 import HistoryItem from './components/HistoryItem';
 import CalendarHeatmap from './components/CalendarHeatmap';
+import { haptics } from './lib/haptics';
+import { estimateSet, OneRMResult } from './lib/oneRepMax';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('home');
@@ -37,6 +39,9 @@ export default function App() {
   const [expandedExId, setExpandedExId] = useState<string | null>(null);
   const [showSummaryModal, setShowSummaryModal] = useState(false);
   const [summaryData, setSummaryData] = useState({ activeCalories: '', avgHeartRate: '', rpe: '5', note: '', weight: '' });
+  // B4: 完成力量训练时追加爬坡的开关 + 字段
+  const [addCardio, setAddCardio] = useState(false);
+  const [postCardio, setPostCardio] = useState({ duration: '40', incline: '12', speed: '4' });
   const [editingPlanId, setEditingPlanId] = useState<number | null>(null);
   
   const [workoutStartTime, setWorkoutStartTime] = useState<number | null>(null);
@@ -74,7 +79,7 @@ export default function App() {
 
   // Cardio Modal State
   const [showCardioModal, setShowCardioModal] = useState(false);
-  const [cardioData, setCardioData] = useState({ date: '', duration: '40', activeCalories: '', avgHeartRate: '', note: '' });
+  const [cardioData, setCardioData] = useState({ date: '', duration: '40', incline: '12', speed: '4', distance: '', activeCalories: '', avgHeartRate: '', note: '' });
 
   // Rest Day / Lazy Modal State
   const [showRestDayModal, setShowRestDayModal] = useState(false);
@@ -88,6 +93,13 @@ export default function App() {
 
   // Detailed Stats Modal
   const [statsDetailType, setStatsDetailType] = useState<'tonnage' | 'duration' | null>(null);
+
+  // D3: 撤销删除 toast
+  const [undoToast, setUndoToast] = useState<{ message: string; onUndo: () => void } | null>(null);
+  const undoTimerRef = useRef<any>(null);
+
+  // D5: 训练完成庆祝弹窗（含 PR 列表）
+  const [celebration, setCelebration] = useState<{ duration: number; volume: number; prs: Array<{ name: string; weight: number; prevPR: number }> } | null>(null);
 
   // --- Helpers for Fuzzy Matching ---
   const normalizeExerciseName = (name: string) => {
@@ -117,11 +129,23 @@ export default function App() {
 
   // Total Training Days Calculation
   const trainingDaysStats = useMemo(() => {
-    const workouts = history.filter(h => h.type === 'workout');
+    // 把 workout 和 cardio 都算作训练日
+    const workouts = history.filter(h => h.type === 'workout' || h.type === 'cardio');
     const lifetime = new Set(workouts.map(h => h.date)).size;
     const currentYear = new Date().getFullYear().toString();
     const thisYear = new Set(workouts.filter(h => h.date.startsWith(currentYear)).map(h => h.date)).size;
-    return { lifetime, thisYear };
+
+    // 距离上次训练天数（D6）
+    let daysSinceLastWorkout: number | null = null;
+    let lastWorkoutDate: string | null = null;
+    if (workouts.length > 0) {
+      const sortedDates = [...new Set(workouts.map(h => h.date))].sort().reverse();
+      lastWorkoutDate = sortedDates[0];
+      const lastDate = new Date(lastWorkoutDate + 'T00:00:00');
+      const today = new Date(getLocalDateString() + 'T00:00:00');
+      daysSinceLastWorkout = Math.max(0, Math.floor((today.getTime() - lastDate.getTime()) / 86400000));
+    }
+    return { lifetime, thisYear, daysSinceLastWorkout, lastWorkoutDate };
   }, [history]);
 
   // Reward Stats
@@ -192,6 +216,18 @@ export default function App() {
     const exerciseFrequency: Record<string, number> = {};
 
     history.forEach(h => {
+        // 独立有氧（爬坡）
+        if (h.type === 'cardio') {
+            const date = new Date(h.date);
+            weekdayCounts[date.getDay()]++;
+            const duration = h.metrics?.duration || 0;
+            cardioDurationTotal += duration;
+            muscleGroups['有氧/爬坡']++;
+            durationByGroup['有氧/爬坡'] += duration;
+            if (h.date >= weekStart) weeklyDuration += duration;
+            return;
+        }
+
         if (h.type === 'workout') {
             const date = new Date(h.date);
             weekdayCounts[date.getDay()]++;
@@ -200,8 +236,7 @@ export default function App() {
 
             let primaryGroup = '其他';
             const pName = h.planName?.toLowerCase() || '';
-            if (pName.includes('有氧') || pName.includes('爬坡') || pName.includes('跑步')) { primaryGroup = '有氧/爬坡'; cardioDurationTotal += duration; }
-            else if (pName.includes('胸') || pName.includes('推') || pName.includes('day a')) primaryGroup = '胸部';
+            if (pName.includes('胸') || pName.includes('推') || pName.includes('day a')) primaryGroup = '胸部';
             else if (pName.includes('背') || pName.includes('拉') || pName.includes('day b')) primaryGroup = '背部';
             else if (pName.includes('腿') || pName.includes('蹲') || pName.includes('day c')) primaryGroup = '腿部';
             else if (pName.includes('肩') || pName.includes('day d')) primaryGroup = '肩部';
@@ -250,7 +285,7 @@ export default function App() {
     const weekdays = ['周日','周一','周二','周三','周四','周五','周六'];
     
     let streak = 0;
-    const sortedDates = [...new Set(history.filter(h=>h.type==='workout').map(h=>h.date))].sort().reverse();
+    const sortedDates = [...new Set(history.filter(h=>h.type==='workout' || h.type==='cardio').map(h=>h.date))].sort().reverse();
     if(sortedDates.length > 0) {
         const today = getLocalDateString();
         const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
@@ -290,8 +325,8 @@ export default function App() {
   }, [plans, history, legacyExerciseMap]);
 
   const selectedExStats = useMemo(() => {
-      if (!selectedExerciseForChart) return { pr: 0, totalReps: 0 };
-      let pr = 0; let totalReps = 0;
+      if (!selectedExerciseForChart) return { pr: 0, totalReps: 0, oneRM: null as OneRMResult | null };
+      let pr = 0; let totalReps = 0; let bestOneRM: OneRMResult | null = null;
       const targetName = getExerciseNameById(selectedExerciseForChart);
       const targetCore = normalizeExerciseName(targetName);
 
@@ -304,11 +339,55 @@ export default function App() {
                   const logCore = normalizeExerciseName(logName);
                   if (targetCore && logCore && targetCore === logCore) isMatch = true;
               }
-              if (isMatch) h.logs[logExId].forEach(s => { if (s.completed) { const w = parseFloat(s.weight) || 0; const r = parseFloat(s.reps) || 0; if (w > pr) pr = w; totalReps += r; } });
+              if (isMatch) h.logs[logExId].forEach(s => {
+                if (s.completed) {
+                  const w = parseFloat(s.weight) || 0;
+                  const r = parseFloat(s.reps) || 0;
+                  if (w > pr) pr = w;
+                  totalReps += r;
+                  // 1RM 估算：找历史最高估算值
+                  const est = estimateSet(w, r);
+                  if (est && (!bestOneRM || est.value > bestOneRM.value)) bestOneRM = est;
+                }
+              });
           });
       });
-      return { pr, totalReps };
+      return { pr, totalReps, oneRM: bestOneRM };
   }, [selectedExerciseForChart, history, legacyExerciseMap, plans]);
+
+  // D4: 每个动作的历史最大重量（用于训练中实时 PR 检测）
+  // 只统计已 completed 的有效组，且 weight > 0 才算
+  const historicalPRs = useMemo<Record<string, number>>(() => {
+    const map: Record<string, number> = {};
+    history.forEach(h => {
+      if (h.type === 'workout' && h.logs) {
+        Object.entries(h.logs).forEach(([exId, sets]) => {
+          // 用归一化名做 key，自动合并同类动作（如史密斯卧推 vs 平板卧推）
+          const exName = getExerciseNameById(exId);
+          const normalized = normalizeExerciseName(exName) || exId;
+          sets.forEach(s => {
+            if (s.completed) {
+              const w = parseFloat(s.weight) || 0;
+              if (w > 0 && (!map[normalized] || w > map[normalized])) {
+                map[normalized] = w;
+              }
+            }
+          });
+        });
+      }
+    });
+    return map;
+  }, [history, plans, legacyExerciseMap]);
+
+  // 判断当前组是否刷新历史 PR（重量 > 历史最大）
+  const isPRSet = (exId: string, weight: string): boolean => {
+    const w = parseFloat(weight) || 0;
+    if (w <= 0) return false;
+    const exName = getExerciseNameById(exId);
+    const normalized = normalizeExerciseName(exName) || exId;
+    const historical = historicalPRs[normalized] || 0;
+    return w > historical;
+  };
 
   const getExerciseProgressData = (targetExId: string): ChartDataPoint[] => {
       const data: ChartDataPoint[] = [];
@@ -350,7 +429,7 @@ export default function App() {
 
   useEffect(() => {
     let interval: any;
-    if (isResting && restTimer > 0) { interval = setInterval(() => { setRestTimer((prev) => { if (prev <= 1) { if (navigator.vibrate) navigator.vibrate([200, 100, 200]); setIsResting(false); return 0; } return prev - 1; }); }, 1000); } 
+    if (isResting && restTimer > 0) { interval = setInterval(() => { setRestTimer((prev) => { if (prev <= 1) { haptics.done(); setIsResting(false); return 0; } return prev - 1; }); }, 1000); }
     else if (restTimer <= 0) setIsResting(false);
     return () => clearInterval(interval);
   }, [isResting, restTimer]);
@@ -374,10 +453,24 @@ export default function App() {
     loadObj('fitness_legacy_map_v1', setLegacyExerciseMap);
     
     if (loadedHistory && loadedHistory.length > 0) {
-        const sortedHistory = [...loadedHistory].sort((a: HistoryItemType, b: HistoryItemType) => b.timestamp - a.timestamp);
+        // 数据迁移：老的 type='workout' + planName 含"有氧/爬坡/跑步" → type='cardio'
+        let migrated = false;
+        const migratedHistory = loadedHistory.map((h: HistoryItemType) => {
+          if (h.type === 'workout' && h.planName && (h.planName.includes('有氧') || h.planName.includes('爬坡') || h.planName.includes('跑步'))) {
+            migrated = true;
+            return { ...h, type: 'cardio' as const, planName: '爬坡' };
+          }
+          return h;
+        });
+        if (migrated) {
+          setHistory(migratedHistory);
+          localStorage.setItem('fitness_history_v6', JSON.stringify(migratedHistory));
+        }
+
+        const sortedHistory = [...migratedHistory].sort((a: HistoryItemType, b: HistoryItemType) => b.timestamp - a.timestamp);
         const lastEntryDateStr = sortedHistory[0].date;
         const todayStr = getLocalDateString();
-        
+
         if (lastEntryDateStr < todayStr) {
             const newRestDays: HistoryItemType[] = [];
             let curr = new Date(lastEntryDateStr); curr.setDate(curr.getDate() + 1); const today = new Date(todayStr);
@@ -386,7 +479,7 @@ export default function App() {
                 if (!sortedHistory.find((h: any) => h.date === dateStr)) { newRestDays.push({ date: dateStr, timestamp: curr.getTime(), type: 'rest', planName: '自动记录', note: '默认休息' }); }
                 curr.setDate(curr.getDate() + 1);
             }
-            if (newRestDays.length > 0) { const combined = [...newRestDays.reverse(), ...loadedHistory]; setHistory(combined); localStorage.setItem('fitness_history_v6', JSON.stringify(combined)); }
+            if (newRestDays.length > 0) { const combined = [...newRestDays.reverse(), ...migratedHistory]; setHistory(combined); localStorage.setItem('fitness_history_v6', JSON.stringify(combined)); }
         }
     }
 
@@ -437,7 +530,8 @@ export default function App() {
     const newLogs = { ...workoutLogs };
     if (newLogs[exId]) {
         const sets = [...newLogs[exId]]; const currentSet = sets[idx]; const wasCompleted = currentSet.completed; currentSet.completed = !currentSet.completed; sets[idx] = currentSet; newLogs[exId] = sets;
-        if (!wasCompleted && currentSet.completed) startRestTimer(90);
+        if (!wasCompleted && currentSet.completed) { haptics.medium(); startRestTimer(90); }
+        else haptics.light();
     }
     setWorkoutLogs(newLogs);
   };
@@ -453,6 +547,21 @@ export default function App() {
     if (newLogs[exId] && newLogs[exId].length > 1) { newLogs[exId] = newLogs[exId].filter((_, i) => i !== idx); setWorkoutLogs(newLogs); }
   };
 
+  // D2: 把上一组的 weight/reps 复制到当前组
+  const copyFromPrevious = (exId: string, idx: number) => {
+    if (idx === 0) return;
+    const newLogs = { ...workoutLogs };
+    if (newLogs[exId]) {
+      const sets = [...newLogs[exId]];
+      const prev = sets[idx - 1];
+      if (!prev) return;
+      sets[idx] = { ...sets[idx], weight: prev.weight, reps: prev.reps };
+      newLogs[exId] = sets;
+      setWorkoutLogs(newLogs);
+      haptics.light();
+    }
+  };
+
   const confirmFinishWorkout = () => {
     stopRestTimer();
     const date = getLocalDateString();
@@ -463,44 +572,96 @@ export default function App() {
 
     let totalVolume = 0;
     const newExHistory = { ...exerciseHistory };
-    
+
+    // D5: 收集本次训练里刷新的 PR 列表
+    const prs: Array<{ name: string; weight: number; prevPR: number }> = [];
+
     if (activeWorkout) {
         Object.keys(workoutLogs).forEach(exId => {
         const sets = workoutLogs[exId];
         const exDef = activeWorkout.exercises.find(e => e.id === exId);
         let setVol = 0;
-        sets.forEach(s => { 
+        let exMaxThisSession = 0;
+        sets.forEach(s => {
             if (s.completed) {
                 const w = parseFloat(s.weight) || 0; const r = parseFloat(s.reps) || 0;
                 if (exDef && exDef.unit === 'reps_only') setVol += r; else if (exDef && exDef.unit === 'time') setVol += w; else { if (w > 0 && r > 0) setVol += w * r; }
+                if (w > exMaxThisSession) exMaxThisSession = w;
             }
         });
         totalVolume += setVol;
         const lastValidSet = [...sets].reverse().find(s => s.weight && s.completed);
         if (lastValidSet) newExHistory[exId] = { weight: lastValidSet.weight, date };
+
+        // PR 检测：只对负重动作算
+        if (exDef && exDef.unit === 'weight_reps' && exMaxThisSession > 0) {
+            const exName = exDef.name;
+            const normalized = normalizeExerciseName(exName) || exId;
+            const prevPR = historicalPRs[normalized] || 0;
+            if (exMaxThisSession > prevPR) {
+                prs.push({ name: exName, weight: exMaxThisSession, prevPR });
+            }
+        }
         });
-        
+
         const newEntry: HistoryItemType = { date, timestamp: Date.now(), type: 'workout', planName: activeWorkout.name, logs: workoutLogs, metrics: { volume: totalVolume, duration: durationMinutes, ...summaryData } };
-        const newHistory = [newEntry, ...history];
+        let newHistory = [newEntry, ...history];
+
+        // B4: 如果勾选了"今天还做了爬坡"，追加一条关联的 cardio 记录
+        if (addCardio && postCardio.duration) {
+          const cardioEntry: HistoryItemType = {
+            date,
+            timestamp: Date.now() + 1, // +1 ms 保证排序在主记录之后
+            type: 'cardio',
+            planName: '爬坡',
+            metrics: {
+              duration: parseInt(postCardio.duration),
+              incline: postCardio.incline,
+              speed: postCardio.speed,
+            },
+            linkedWorkoutTs: newEntry.timestamp,
+          };
+          newHistory = [cardioEntry, ...newHistory];
+        }
+
         setHistory(newHistory); setExerciseHistory(newExHistory);
         saveToLocal('fitness_history_v6', newHistory); saveToLocal('fitness_ex_history_v6', newExHistory);
-        
+
         const nextIndex = (currentPlanIndex + 1) % plans.length;
         setCurrentPlanIndex(nextIndex); saveToLocal('fitness_plan_index_v6', nextIndex.toString());
-        
-        setShowSummaryModal(false); setActiveWorkout(null); setWorkoutLogs({}); setSummaryData({ activeCalories: '', avgHeartRate: '', rpe: '5', note: '', weight: '' }); setActiveTab('home'); setWorkoutStartTime(null);
-        setTimeout(() => { exportData(); alert(`🎉 训练完成！耗时 ${durationMinutes} 分钟。数据已自动备份。`); }, 500);
+
+        setShowSummaryModal(false); setActiveWorkout(null); setWorkoutLogs({}); setSummaryData({ activeCalories: '', avgHeartRate: '', rpe: '5', note: '', weight: '' }); setAddCardio(false); setPostCardio({ duration: '40', incline: '12', speed: '4' }); setActiveTab('home'); setWorkoutStartTime(null);
+
+        haptics.success();
+        // 弹出庆祝（替代原 alert），后台静默备份
+        setCelebration({ duration: durationMinutes, volume: totalVolume, prs });
+        setTimeout(() => { exportData(); }, 500);
     }
   };
 
   const saveCardioLog = () => {
       if (!cardioData.duration) { alert("请至少填写持续时间"); return; }
       const date = cardioData.date || getLocalDateString();
-      const newEntry: HistoryItemType = { date, timestamp: new Date(date).getTime() + 1000, type: 'workout', planName: '有氧爬坡', metrics: { duration: parseInt(cardioData.duration), activeCalories: cardioData.activeCalories, avgHeartRate: cardioData.avgHeartRate, note: cardioData.note || '有氧训练' } };
+      const newEntry: HistoryItemType = {
+        date,
+        timestamp: new Date(date).getTime() + 1000,
+        type: 'cardio',
+        planName: '爬坡',
+        metrics: {
+          duration: parseInt(cardioData.duration),
+          incline: cardioData.incline,
+          speed: cardioData.speed,
+          distance: cardioData.distance,
+          activeCalories: cardioData.activeCalories,
+          avgHeartRate: cardioData.avgHeartRate,
+          note: cardioData.note,
+        },
+      };
       const newHistory = [newEntry, ...history].sort((a,b) => b.timestamp - a.timestamp);
       setHistory(newHistory); saveToLocal('fitness_history_v6', newHistory);
-      setShowCardioModal(false); setCardioData({ date: '', duration: '40', activeCalories: '', avgHeartRate: '', note: '' });
-      alert("🏃 有氧记录已保存！");
+      setShowCardioModal(false);
+      setCardioData({ date: '', duration: '40', incline: '12', speed: '4', distance: '', activeCalories: '', avgHeartRate: '', note: '' });
+      haptics.medium();
   }
 
   const openRestDayModal = (item?: HistoryItemType) => {
@@ -551,11 +712,44 @@ export default function App() {
     setRewardModalData({ streak, monthCount: thisMonthCount, time: timeStr, todayCount }); setShowRewardModal(true);
   };
 
+  // D3: 软删除 + 5 秒撤销 toast
+  const showUndoToast = (message: string, onUndo: () => void) => {
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    setUndoToast({ message, onUndo });
+    undoTimerRef.current = setTimeout(() => setUndoToast(null), 5000);
+  };
+
   const executeDelete = () => {
       if (!deleteConfirmItem) return;
-      if (deleteConfirmItem.type === 'history') { const newHistory = history.filter(h => String(h.timestamp) !== String(deleteConfirmItem.data.timestamp)); setHistory(newHistory); saveToLocal('fitness_history_v6', newHistory); } 
-      else if (deleteConfirmItem.type === 'weight') { const newStats = bodyStats.filter(s => String(s.timestamp) !== String(deleteConfirmItem.data.timestamp)); setBodyStats(newStats); saveToLocal('fitness_stats_v6', newStats); } 
-      else if (deleteConfirmItem.type === 'plan') { if (plans.length <= 1) { alert('至少需要保留一个训练计划！'); setDeleteConfirmItem(null); return; } const newPlans = plans.filter((_, i) => i !== deleteConfirmItem.index); updatePlans(newPlans); setCurrentPlanIndex(0); saveToLocal('fitness_plan_index_v6', '0'); }
+      haptics.warning();
+      if (deleteConfirmItem.type === 'history') {
+          const removed = deleteConfirmItem.data as HistoryItemType;
+          const newHistory = history.filter(h => String(h.timestamp) !== String(removed.timestamp));
+          setHistory(newHistory); saveToLocal('fitness_history_v6', newHistory);
+          showUndoToast('已删除训练记录', () => {
+            const restored = [removed, ...newHistory].sort((a,b) => b.timestamp - a.timestamp);
+            setHistory(restored); saveToLocal('fitness_history_v6', restored);
+          });
+      } else if (deleteConfirmItem.type === 'weight') {
+          const removed = deleteConfirmItem.data as BodyStat;
+          const newStats = bodyStats.filter(s => String(s.timestamp) !== String(removed.timestamp));
+          setBodyStats(newStats); saveToLocal('fitness_stats_v6', newStats);
+          showUndoToast('已删除体重记录', () => {
+            const restored = [removed, ...newStats].sort((a,b) => b.timestamp - a.timestamp);
+            setBodyStats(restored); saveToLocal('fitness_stats_v6', restored);
+          });
+      } else if (deleteConfirmItem.type === 'plan') {
+          if (plans.length <= 1) { alert('至少需要保留一个训练计划！'); setDeleteConfirmItem(null); return; }
+          const removedIndex = deleteConfirmItem.index!;
+          const removed = plans[removedIndex];
+          const newPlans = plans.filter((_, i) => i !== removedIndex);
+          updatePlans(newPlans); setCurrentPlanIndex(0); saveToLocal('fitness_plan_index_v6', '0');
+          showUndoToast(`已删除计划「${removed.name}」`, () => {
+            const restored = [...newPlans];
+            restored.splice(removedIndex, 0, removed);
+            updatePlans(restored);
+          });
+      }
       setDeleteConfirmItem(null);
   };
 
@@ -648,14 +842,55 @@ export default function App() {
       if (!showCardioModal) return null;
       return (
           <div className="fixed inset-0 z-[150] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in" onClick={() => setShowCardioModal(false)}>
-              <div className="bg-white w-full max-w-sm rounded-[2rem] p-6 shadow-2xl animate-in zoom-in-95" onClick={e => e.stopPropagation()}>
-                  <div className="flex items-center gap-3 mb-6"><div className="p-3 bg-emerald-50 text-emerald-600 rounded-full"><Footprints size={24}/></div><h3 className="text-xl font-black text-slate-800">有氧/爬坡记录</h3></div>
+              <div className="bg-white w-full max-w-sm rounded-[2rem] p-6 shadow-2xl animate-in zoom-in-95 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+                  <div className="flex items-center gap-3 mb-6">
+                    <div className="p-3 bg-emerald-50 text-emerald-600 rounded-full"><Footprints size={24}/></div>
+                    <div>
+                      <h3 className="text-xl font-black text-slate-800">爬坡记录</h3>
+                      <p className="text-[10px] text-slate-400 font-bold">Incline Walking</p>
+                    </div>
+                  </div>
                   <div className="space-y-4">
-                      <div><label className="text-xs font-bold text-slate-400 uppercase">日期</label><input type="date" value={cardioData.date || getLocalDateString()} onChange={(e) => setCardioData({...cardioData, date: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" /></div>
-                      <div><label className="text-xs font-bold text-slate-400 uppercase">时长 (分钟) *</label><input type="number" value={cardioData.duration} onChange={(e) => setCardioData({...cardioData, duration: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-lg font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="40" autoFocus /></div>
-                      <div className="grid grid-cols-2 gap-3"><div><label className="text-xs font-bold text-slate-400 uppercase">消耗 (Kcal)</label><input type="number" value={cardioData.activeCalories} onChange={(e) => setCardioData({...cardioData, activeCalories: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="-" /></div><div><label className="text-xs font-bold text-slate-400 uppercase">平均心率</label><input type="number" value={cardioData.avgHeartRate} onChange={(e) => setCardioData({...cardioData, avgHeartRate: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="-" /></div></div>
-                      <div><label className="text-xs font-bold text-slate-400 uppercase">备注</label><input value={cardioData.note} onChange={(e) => setCardioData({...cardioData, note: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-sm font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="强度如何？" /></div>
-                      <div className="grid grid-cols-2 gap-3 pt-2"><button onClick={() => setShowCardioModal(false)} className="py-3 rounded-xl font-bold text-slate-500 bg-slate-100">取消</button><button onClick={saveCardioLog} className="py-3 rounded-xl font-bold text-white bg-emerald-500 shadow-lg shadow-emerald-200 hover:bg-emerald-600 transition-all">保存</button></div>
+                      <div>
+                        <label className="text-xs font-bold text-slate-400 uppercase">日期</label>
+                        <input type="date" value={cardioData.date || getLocalDateString()} onChange={(e) => setCardioData({...cardioData, date: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold text-slate-400 uppercase">时长 (分钟) *</label>
+                        <input type="text" inputMode="decimal" value={cardioData.duration} onChange={(e) => setCardioData({...cardioData, duration: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-lg font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="40" autoFocus />
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="text-xs font-bold text-slate-400 uppercase">坡度 (%)</label>
+                          <input type="text" inputMode="decimal" value={cardioData.incline} onChange={(e) => setCardioData({...cardioData, incline: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="12" />
+                        </div>
+                        <div>
+                          <label className="text-xs font-bold text-slate-400 uppercase">速度 (km/h)</label>
+                          <input type="text" inputMode="decimal" value={cardioData.speed} onChange={(e) => setCardioData({...cardioData, speed: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="4" />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-3 gap-3">
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-400 uppercase">距离 (km)</label>
+                          <input type="text" inputMode="decimal" value={cardioData.distance} onChange={(e) => setCardioData({...cardioData, distance: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="-" />
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-400 uppercase">消耗 (Kcal)</label>
+                          <input type="text" inputMode="decimal" value={cardioData.activeCalories} onChange={(e) => setCardioData({...cardioData, activeCalories: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="-" />
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-400 uppercase">心率</label>
+                          <input type="text" inputMode="decimal" value={cardioData.avgHeartRate} onChange={(e) => setCardioData({...cardioData, avgHeartRate: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="-" />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold text-slate-400 uppercase">备注</label>
+                        <input value={cardioData.note} onChange={(e) => setCardioData({...cardioData, note: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-sm font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-100" placeholder="今天感觉怎么样？" />
+                      </div>
+                      <div className="grid grid-cols-2 gap-3 pt-2">
+                        <button onClick={() => setShowCardioModal(false)} className="py-3 rounded-xl font-bold text-slate-500 bg-slate-100">取消</button>
+                        <button onClick={saveCardioLog} className="py-3 rounded-xl font-bold text-white bg-emerald-500 shadow-lg shadow-emerald-200 hover:bg-emerald-600 transition-all">保存</button>
+                      </div>
                   </div>
               </div>
           </div>
@@ -704,8 +939,8 @@ export default function App() {
                  <div className="space-y-4">
                      <div><label className="text-xs font-bold text-slate-400 uppercase">日期 & 时间</label><input type="datetime-local" value={weightEntryData.date} onChange={e => setWeightEntryData({...weightEntryData, date: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 font-bold text-slate-800 outline-none focus:ring-2 ring-blue-100"/></div>
                      <div className="grid grid-cols-2 gap-3">
-                         <div><label className="text-xs font-bold text-slate-400 uppercase">体重 (KG)</label><input type="number" step="0.1" value={weightEntryData.weight} onChange={e => setWeightEntryData({...weightEntryData, weight: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-2xl font-black text-slate-800 outline-none focus:ring-2 ring-blue-100 text-center" placeholder="0.0" autoFocus/></div>
-                         <div><label className="text-xs font-bold text-slate-400 uppercase">体脂率 (%) - 选填</label><input type="number" step="0.1" value={weightEntryData.bodyFat} onChange={e => setWeightEntryData({...weightEntryData, bodyFat: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-2xl font-black text-slate-800 outline-none focus:ring-2 ring-blue-100 text-center" placeholder="0.0" /></div>
+                         <div><label className="text-xs font-bold text-slate-400 uppercase">体重 (KG)</label><input type="text" inputMode="decimal" step="0.1" value={weightEntryData.weight} onChange={e => setWeightEntryData({...weightEntryData, weight: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-2xl font-black text-slate-800 outline-none focus:ring-2 ring-blue-100 text-center" placeholder="0.0" autoFocus/></div>
+                         <div><label className="text-xs font-bold text-slate-400 uppercase">体脂率 (%) - 选填</label><input type="text" inputMode="decimal" step="0.1" value={weightEntryData.bodyFat} onChange={e => setWeightEntryData({...weightEntryData, bodyFat: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-2xl font-black text-slate-800 outline-none focus:ring-2 ring-blue-100 text-center" placeholder="0.0" /></div>
                      </div>
                      <div className="grid grid-cols-2 gap-3 pt-2"><button onClick={() => setShowWeightModal(false)} className="py-3 rounded-xl font-bold text-slate-500 bg-slate-100">取消</button><button onClick={confirmWeightEntry} className="py-3 rounded-xl font-bold text-white bg-blue-500 shadow-lg shadow-blue-200 hover:bg-blue-600 transition-all">保存</button></div>
                  </div>
@@ -735,6 +970,90 @@ export default function App() {
         </div>
     )
   }
+
+  // D5: 训练完成庆祝弹窗（替代 alert）
+  const renderCelebrationModal = () => {
+    if (!celebration) return null;
+    const { duration, volume, prs } = celebration;
+    return (
+      <div className="fixed inset-0 z-[250] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-in fade-in" onClick={() => setCelebration(null)}>
+        <div className="bg-gradient-to-br from-orange-50 via-white to-yellow-50 w-full max-w-sm md:max-w-md rounded-[2rem] p-8 shadow-2xl text-center scale-100 animate-in zoom-in-95 relative overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="absolute top-0 right-0 w-40 h-40 bg-yellow-200 rounded-full blur-3xl opacity-40 -mr-10 -mt-10 pointer-events-none"></div>
+          <div className="absolute bottom-0 left-0 w-40 h-40 bg-orange-200 rounded-full blur-3xl opacity-40 -ml-10 -mb-10 pointer-events-none"></div>
+
+          <div className="relative">
+            <div className="w-20 h-20 bg-gradient-to-br from-orange-500 to-red-500 text-white rounded-full flex items-center justify-center mx-auto mb-4 shadow-xl shadow-orange-200 ring-4 ring-white">
+              <Flame size={40} fill="currentColor"/>
+            </div>
+            <h3 className="text-3xl font-black text-slate-800 mb-1">训练完成！</h3>
+            <p className="text-slate-400 text-sm font-medium mb-6">辛苦了，明天又是好汉一条 💪</p>
+
+            <div className="grid grid-cols-2 gap-3 mb-6">
+              <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">耗时</p>
+                <p className="text-2xl font-black text-slate-800">{duration}<span className="text-xs text-slate-400 ml-1">分钟</span></p>
+              </div>
+              <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">总容量</p>
+                <p className="text-2xl font-black text-slate-800">{(volume/1000).toFixed(1)}<span className="text-xs text-slate-400 ml-1">吨</span></p>
+              </div>
+            </div>
+
+            {prs.length > 0 && (
+              <div className="bg-gradient-to-br from-yellow-50 to-orange-50 rounded-2xl p-4 mb-6 border border-yellow-200 text-left">
+                <div className="flex items-center gap-2 mb-3">
+                  <Trophy size={18} className="text-yellow-600" fill="currentColor"/>
+                  <span className="font-black text-yellow-700">恭喜！打破 {prs.length} 个 PR</span>
+                </div>
+                <div className="space-y-2">
+                  {prs.map((pr, i) => (
+                    <div key={i} className="flex items-center justify-between text-xs">
+                      <span className="font-bold text-slate-700 truncate flex-1 mr-2">{pr.name}</span>
+                      <span className="font-mono font-bold text-yellow-600 shrink-0">
+                        {pr.weight}kg
+                        {pr.prevPR > 0 && <span className="text-slate-300 ml-1">(上次 {pr.prevPR})</span>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <p className="text-[10px] text-slate-400 mb-4">数据已自动备份到本地</p>
+            <button onClick={() => setCelebration(null)} className="w-full py-4 rounded-2xl font-black text-white bg-gradient-to-r from-orange-500 to-red-500 shadow-lg shadow-orange-200 active:scale-95 transition-all">
+              收下，继续努力 🔥
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // D3: 撤销 toast（5 秒后自动消失）
+  const renderUndoToast = () => {
+    if (!undoToast) return null;
+    return (
+      <div className="fixed bottom-24 left-0 right-0 mx-auto w-full max-w-sm px-4 z-[300] animate-in fade-in slide-in-from-bottom-4 mb-safe pointer-events-none">
+        <div className="bg-slate-900/95 backdrop-blur-md text-white p-3 rounded-2xl shadow-2xl flex items-center justify-between border border-slate-700/50 ring-1 ring-white/10 pointer-events-auto">
+          <div className="flex items-center gap-2 text-sm">
+            <Trash2 size={16} className="text-slate-400"/>
+            <span className="font-bold">{undoToast.message}</span>
+          </div>
+          <button
+            onClick={() => {
+              undoToast.onUndo();
+              if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+              setUndoToast(null);
+              haptics.light();
+            }}
+            className="px-3 py-1.5 rounded-lg bg-orange-500 text-white font-black text-xs active:scale-95 transition-all"
+          >
+            撤销
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   const renderRewardAnalysisModal = () => {
     if (!showRewardAnalysis) return null;
@@ -823,13 +1142,47 @@ export default function App() {
     if (!showSummaryModal) return null;
     return (
       <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in">
-        <div className="bg-white w-full max-w-md md:max-w-lg rounded-3xl p-6 shadow-2xl animate-in slide-in-from-bottom-10 mb-safe">
+        <div className="bg-white w-full max-w-md md:max-w-lg rounded-3xl p-6 shadow-2xl animate-in slide-in-from-bottom-10 mb-safe max-h-[90vh] overflow-y-auto">
           <h3 className="text-2xl font-black text-slate-800 mb-1">🎉 训练完成！</h3>
           <p className="text-slate-400 text-sm mb-6">辛苦了，记录一下今天的感受吧。</p>
           <div className="space-y-4">
-            <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100"><label className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1"><AlertTriangle size={12}/> 今日体重 (选填)</label><div className="flex items-center gap-2 mt-2"><input type="number" placeholder="0.0" value={summaryData.weight} onChange={(e)=>setSummaryData({...summaryData, weight: e.target.value})} className="flex-1 bg-white p-3 rounded-xl text-xl font-black text-slate-800 outline-none focus:ring-2 ring-orange-200 text-center"/><span className="font-bold text-slate-400">KG</span></div><p className="text-[10px] text-slate-400 mt-2 text-center">可稍后在数据分析页补充</p></div>
+            <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100"><label className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1"><AlertTriangle size={12}/> 今日体重 (选填)</label><div className="flex items-center gap-2 mt-2"><input type="text" inputMode="decimal" placeholder="0.0" value={summaryData.weight} onChange={(e)=>setSummaryData({...summaryData, weight: e.target.value})} className="flex-1 bg-white p-3 rounded-xl text-xl font-black text-slate-800 outline-none focus:ring-2 ring-orange-200 text-center"/><span className="font-bold text-slate-400">KG</span></div><p className="text-[10px] text-slate-400 mt-2 text-center">可稍后在数据分析页补充</p></div>
             <div><label className="text-xs font-bold text-slate-400 uppercase tracking-wider">强度系数 (RPE 1-10)</label><div className="flex items-center gap-4 mt-2"><input type="range" min="1" max="10" step="0.5" value={summaryData.rpe} onChange={(e) => setSummaryData({...summaryData, rpe: e.target.value})} className="flex-1 h-2 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-orange-500"/><span className="text-xl font-black text-orange-500 w-8 text-right">{summaryData.rpe}</span></div></div>
             <div><label className="text-[10px] font-bold text-slate-400 uppercase">训练心得 / 备注</label><textarea rows={2} placeholder="今天状态如何？哪里不舒服？" value={summaryData.note} onChange={(e)=>setSummaryData({...summaryData, note: e.target.value})} className="w-full bg-slate-50 p-3 rounded-xl mt-1 text-sm text-slate-800 outline-none focus:ring-2 ring-orange-100 resize-none"/></div>
+
+            {/* B4: 今天还做了爬坡吗 */}
+            <div className={`p-4 rounded-2xl border transition-all ${addCardio ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-100'}`}>
+              <button
+                type="button"
+                onClick={() => { setAddCardio(!addCardio); haptics.light(); }}
+                className="w-full flex items-center justify-between"
+              >
+                <div className="flex items-center gap-2">
+                  <Mountain size={16} className={addCardio ? 'text-emerald-600' : 'text-slate-400'}/>
+                  <span className={`text-sm font-bold ${addCardio ? 'text-emerald-700' : 'text-slate-600'}`}>今天还做了爬坡？</span>
+                </div>
+                <div className={`w-11 h-6 rounded-full p-0.5 transition-colors ${addCardio ? 'bg-emerald-500' : 'bg-slate-300'}`}>
+                  <div className={`w-5 h-5 rounded-full bg-white shadow-sm transition-transform ${addCardio ? 'translate-x-5' : ''}`}/>
+                </div>
+              </button>
+              {addCardio && (
+                <div className="grid grid-cols-3 gap-2 mt-3 animate-in fade-in">
+                  <div>
+                    <label className="text-[10px] font-bold text-emerald-600/70 uppercase">分钟</label>
+                    <input type="text" inputMode="decimal" value={postCardio.duration} onChange={(e) => setPostCardio({...postCardio, duration: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-white p-2 rounded-lg mt-1 text-center font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-200" placeholder="40"/>
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-bold text-emerald-600/70 uppercase">坡度%</label>
+                    <input type="text" inputMode="decimal" value={postCardio.incline} onChange={(e) => setPostCardio({...postCardio, incline: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-white p-2 rounded-lg mt-1 text-center font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-200" placeholder="12"/>
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-bold text-emerald-600/70 uppercase">速度</label>
+                    <input type="text" inputMode="decimal" value={postCardio.speed} onChange={(e) => setPostCardio({...postCardio, speed: e.target.value.replace(/[^0-9.]/g, '')})} className="w-full bg-white p-2 rounded-lg mt-1 text-center font-bold text-slate-800 outline-none focus:ring-2 ring-emerald-200" placeholder="4"/>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div className="pt-2"><button onClick={confirmFinishWorkout} className="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold text-lg shadow-lg shadow-slate-300 active:scale-95 transition-all flex items-center justify-center gap-2"><Save size={20}/> 保存并自动备份</button><button onClick={() => setShowSummaryModal(false)} className="w-full text-slate-400 text-sm py-3 font-bold mt-1">返回修改</button></div>
           </div>
         </div>
@@ -880,14 +1233,32 @@ export default function App() {
                     </div>
                     <div className="flex text-[10px] font-bold text-slate-400 px-2 mb-1 text-center"><div className="w-12">组</div><div className="flex-1">{ex.unit === 'reps_only' ? '无需负重' : (ex.unit === 'time' ? '时长(分)' : '重量(kg)')}</div><div className="flex-1">{ex.unit === 'time' ? (isRelaxation ? '无需记录' : '强度/速度') : '次数'}</div><div className="w-10">打勾</div></div>
                     <div className="space-y-2">
-                      {logs.map((set, idx) => (
-                        <div key={idx} className={`flex items-center gap-2 p-2 rounded-xl transition-colors ${set.completed ? 'bg-green-50 border border-green-100' : 'bg-white border border-slate-100'}`}>
-                          <div className="w-12 flex items-center justify-center gap-1">{logs.length > 1 ? (<button onClick={() => deleteSet(ex.id, idx)} className="text-slate-200 hover:text-red-500 p-1"><X size={12}/></button>) : <span className="w-4"></span>}<span className="font-bold text-slate-300 text-sm w-3 text-center">{idx + 1}</span></div>
+                      {logs.map((set, idx) => {
+                        const showPR = set.completed && ex.unit === 'weight_reps' && isPRSet(ex.id, set.weight);
+                        return (
+                        <div key={idx} className={`flex items-center gap-2 p-2 rounded-xl transition-colors ${showPR ? 'bg-yellow-50 border border-yellow-200 ring-1 ring-yellow-300/50 animate-pr-flash' : set.completed ? 'bg-green-50 border border-green-100' : 'bg-white border border-slate-100'}`}>
+                          <div className="w-12 flex items-center justify-center gap-1">
+                            {logs.length > 1 ? (<button onClick={() => deleteSet(ex.id, idx)} className="text-slate-200 hover:text-red-500 p-1"><X size={12}/></button>) : <span className="w-4"></span>}
+                            <span className={`font-bold text-sm w-3 text-center ${showPR ? 'text-yellow-600' : 'text-slate-300'}`}>{idx + 1}</span>
+                            {idx > 0 && !set.completed && (
+                              <button
+                                type="button"
+                                onClick={() => copyFromPrevious(ex.id, idx)}
+                                title="同上一组"
+                                className="text-slate-300 hover:text-orange-500 p-1 active:scale-90 transition-all"
+                              >
+                                <ArrowDown size={12}/>
+                              </button>
+                            )}
+                          </div>
                           <SmartInput placeholder={ex.unit === 'reps_only' ? '-' : (lastRecord?.weight || '0')} value={set.weight} onChange={(v) => updateSet(ex.id, idx, 'weight', v)} step={ex.unit === 'time' ? 1 : 2.5} disabled={ex.unit === 'reps_only'} />
                           <SmartInput placeholder={ex.defaultReps} value={set.reps} onChange={(v) => updateSet(ex.id, idx, 'reps', v)} disabled={isRelaxation && ex.unit === 'time'} />
-                          <button onClick={() => toggleSetComplete(ex.id, idx)} className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all active:scale-90 ${set.completed ? 'bg-green-500 text-white shadow-lg shadow-green-200' : 'bg-slate-100 text-slate-300 hover:bg-slate-200'}`}><CheckCircle2 size={20} /></button>
+                          <button onClick={() => toggleSetComplete(ex.id, idx)} className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all active:scale-90 ${showPR ? 'bg-yellow-500 text-white shadow-lg shadow-yellow-200' : set.completed ? 'bg-green-500 text-white shadow-lg shadow-green-200' : 'bg-slate-100 text-slate-300 hover:bg-slate-200'}`} title={showPR ? '🏆 新 PR！' : ''}>
+                            {showPR ? <Trophy size={18} fill="currentColor"/> : <CheckCircle2 size={20} />}
+                          </button>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                     <button onClick={() => addSet(ex.id)} className="w-full mt-3 py-2 flex items-center justify-center gap-2 text-xs font-bold text-slate-400 bg-white border border-dashed border-slate-300 rounded-xl hover:bg-slate-50 transition-colors"><PlusCircle size={14}/> 增加一组</button>
                   </div>
@@ -923,7 +1294,20 @@ export default function App() {
     return (
       <div className="space-y-6 animate-in p-4 pb-32 relative" onClick={() => setShowPlanSelector(false)}>
         <div className="flex items-center justify-between px-2">
-            <div><p className="text-slate-400 text-xs font-bold uppercase tracking-wider mb-0.5">Welcome Back</p><h2 className="text-xl font-black text-slate-800">Ready to crush it?</h2></div>
+            <div>
+              <p className="text-slate-400 text-xs font-bold uppercase tracking-wider mb-0.5">Welcome Back</p>
+              <h2 className="text-xl font-black text-slate-800">
+                {(() => {
+                  const d = trainingDaysStats.daysSinceLastWorkout;
+                  if (d === null) return 'Ready to crush it?';
+                  if (d === 0) return '今天已训练，干得漂亮 💪';
+                  if (d === 1) return '昨天刚练，继续保持 🔥';
+                  if (d <= 3) return `已休息 ${d} 天，准备好了吗？`;
+                  if (d <= 7) return `${d} 天没练了，肌肉在等你 🦾`;
+                  return `🥲 ${d} 天没练了，今天重新开始`;
+                })()}
+              </h2>
+            </div>
         </div>
         <div className="flex items-center gap-3 px-2 mb-2">
              <div className="flex-1 bg-white p-3 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-3 relative overflow-hidden"><div className="p-2 bg-orange-50 text-orange-500 rounded-xl relative z-10"><Calendar size={20}/></div><div className="relative z-10"><p className="text-[10px] font-bold text-slate-400 uppercase">今年累计</p><p className="text-xl font-black text-slate-800">{trainingDaysStats.thisYear} <span className="text-xs font-bold text-slate-300">天</span></p></div><Calendar className="absolute -right-2 -bottom-2 text-orange-500 opacity-5 w-16 h-16" /></div>
@@ -938,7 +1322,32 @@ export default function App() {
              <div className="flex items-center gap-2 mb-2"><button onClick={() => fileRef.current?.click()} className="bg-white/20 backdrop-blur-md text-white text-[10px] font-bold px-3 py-1 rounded-full uppercase tracking-wider flex items-center gap-1 hover:bg-white/30 transition-colors"><FileDown size={12}/> 恢复备份</button></div>
              <div className="relative">
                  <button onClick={(e) => { e.stopPropagation(); setShowPlanSelector(!showPlanSelector); }} className="flex items-center gap-1 bg-white/20 hover:bg-white/30 backdrop-blur-md px-3 py-1.5 rounded-full text-xs font-bold transition-colors"><Repeat size={12} /> 切换计划</button>
-                 {showPlanSelector && (<div className="absolute right-0 top-full mt-2 w-40 bg-white rounded-xl shadow-xl border border-slate-100 overflow-hidden py-1 z-50 animate-in fade-in zoom-in-95 origin-top-right">{plans.map((p, idx) => (<button key={p.id} onClick={() => { setCurrentPlanIndex(idx); localStorage.setItem('fitness_plan_index_v6', idx.toString()); setShowPlanSelector(false); }} className={`w-full text-left px-4 py-3 text-sm font-bold hover:bg-slate-50 transition-colors flex justify-between items-center ${idx === currentPlanIndex ? 'text-orange-500 bg-orange-50' : 'text-slate-700'}`}>{p.name.split(':')[0]}{idx === currentPlanIndex && <CheckCircle2 size={14} />}</button>))}</div>)}
+                 {showPlanSelector && (
+                   <div className="absolute right-0 top-full mt-2 w-72 bg-white rounded-2xl shadow-xl border border-slate-100 overflow-hidden py-2 z-50 animate-in fade-in zoom-in-95 origin-top-right max-h-[70vh] overflow-y-auto">
+                     {plans.map((p, idx) => {
+                       const mainExercises = p.exercises.filter(e => e.category.includes('力量') || e.category.includes('🏋️'));
+                       const isCurrent = idx === currentPlanIndex;
+                       return (
+                         <button
+                           key={p.id}
+                           onClick={() => { setCurrentPlanIndex(idx); localStorage.setItem('fitness_plan_index_v6', idx.toString()); setShowPlanSelector(false); haptics.light(); }}
+                           className={`w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors border-b border-slate-50 last:border-0 ${isCurrent ? 'bg-orange-50/50' : ''}`}
+                         >
+                           <div className="flex justify-between items-center mb-1">
+                             <span className={`font-bold text-sm ${isCurrent ? 'text-orange-500' : 'text-slate-700'}`}>{p.name}</span>
+                             {isCurrent && <CheckCircle2 size={14} className="text-orange-500"/>}
+                           </div>
+                           {mainExercises.length > 0 && (
+                             <div className="text-[10px] text-slate-400 leading-relaxed">
+                               {mainExercises.slice(0, 4).map(e => e.name).join(' · ')}
+                               {mainExercises.length > 4 && ` +${mainExercises.length - 4}`}
+                             </div>
+                           )}
+                         </button>
+                       );
+                     })}
+                   </div>
+                 )}
              </div>
           </div>
           <div className="relative z-10"><div className="flex items-center gap-1 mb-1 opacity-80"><Zap size={12} fill="currentColor"/> Next Workout</div><h2 className="text-4xl font-black italic leading-none tracking-tight">{next.name.split(':')[0]}</h2><p className="text-orange-100 text-lg font-medium mt-1 opacity-90">{next.name.split(':')[1] || '训练计划'}</p></div>
@@ -983,9 +1392,9 @@ export default function App() {
                 <div className="space-y-6 animate-in md:grid md:grid-cols-2 md:gap-4 md:space-y-0">
                     <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden"><div className="flex items-center justify-between mb-2"><div className="flex items-center gap-3"><div className="p-2 bg-blue-50 rounded-full text-blue-500"><PersonStanding size={20}/></div><h3 className="font-bold text-slate-800">体重变化趋势</h3></div><button onClick={() => { setWeightEntryData({ date: getLocalDateString().replace(' ','T'), weight: '', bodyFat: '' }); setShowWeightModal(true); }} className="p-2 bg-slate-100 rounded-full text-blue-500 hover:bg-blue-100"><Plus size={18}/></button></div>
                     {bodyStats[0]?.bodyFat && <div className="text-xs font-bold text-slate-400 mb-4 px-1">最新体脂: <span className="text-blue-500">{bodyStats[0].bodyFat}%</span></div>}
-                    <SimpleLineChart data={weightDataRecent} color="#3b82f6" suffix="kg" title="Current Weight" /><div className="mt-4 pt-4 border-t border-slate-50 flex gap-2"><input type="number" className="flex-1 bg-slate-50 rounded-xl px-4 py-2 text-sm font-bold text-slate-700 outline-none focus:ring-2 ring-blue-100" placeholder="快速记录今日体重..." onBlur={e=>{if(e.target.value){const ns=[{date:getLocalDateString(),weight:e.target.value, timestamp: Date.now()},...bodyStats];setBodyStats(ns);saveToLocal('fitness_stats_v6',ns);e.target.value='';}}} /></div></div>
+                    <SimpleLineChart data={weightDataRecent} color="#3b82f6" suffix="kg" title="Current Weight" /><div className="mt-4 pt-4 border-t border-slate-50 flex gap-2"><input type="text" inputMode="decimal" className="flex-1 bg-slate-50 rounded-xl px-4 py-2 text-sm font-bold text-slate-700 outline-none focus:ring-2 ring-blue-100" placeholder="快速记录今日体重..." onBlur={e=>{if(e.target.value){const ns=[{date:getLocalDateString(),weight:e.target.value, timestamp: Date.now()},...bodyStats];setBodyStats(ns);saveToLocal('fitness_stats_v6',ns);e.target.value='';}}} /></div></div>
                     <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden"><div className="flex items-center gap-3 mb-6"><div className="p-2 bg-orange-50 rounded-full text-orange-500"><BarChart3 size={20}/></div><h3 className="font-bold text-slate-800">训练容量趋势</h3></div><SimpleLineChart data={volumeDataRecent} color="#f97316" suffix="" title="Total Volume" /><p className="text-[10px] text-slate-400 text-center mt-4">容量 = 重量 × 次数 (反映训练总量)</p></div>
-                    <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden min-h-[400px] md:col-span-2"><div className="flex items-center gap-3 mb-4"><div className="p-2 bg-purple-50 rounded-full text-purple-500"><TrendingUp size={20}/></div><h3 className="font-bold text-slate-800">动作力量曲线</h3></div><div className="mb-6 relative"><select className="w-full p-4 pr-10 bg-slate-50 rounded-2xl font-bold text-slate-700 outline-none border border-slate-100 appearance-none text-sm shadow-sm focus:ring-2 ring-purple-100 transition-all" onChange={(e) => setSelectedExerciseForChart(e.target.value)} value={selectedExerciseForChart || ''}><option value="">-- 选择动作查看进步 --</option>{Object.entries(allHistoryExercises).map(([category, exercises]) => (<optgroup label={category} key={category}>{exercises.map(ex => <option key={ex.id} value={ex.id}>{ex.name}</option>)}</optgroup>))}</select><ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" size={16}/></div>{selectedExerciseForChart ? (<div className="animate-in"><SimpleLineChart data={selectedExData} color="#8b5cf6" suffix="kg" title="Max Weight" height={220} /><div className="grid grid-cols-2 gap-3 mt-6"><div className="bg-purple-50 p-3 rounded-2xl"><p className="text-[10px] font-bold text-purple-400 uppercase">历史最佳 (PR)</p><p className="text-xl font-black text-purple-600">{selectedExStats.pr} <span className="text-xs">kg</span></p></div><div className="bg-slate-50 p-3 rounded-2xl"><p className="text-[10px] font-bold text-slate-400 uppercase">累计次数</p><p className="text-xl font-black text-slate-600">{selectedExStats.totalReps} <span className="text-xs">reps</span></p></div></div><div className="flex items-center gap-2 mt-4 text-[10px] text-slate-400 bg-slate-50 p-2 rounded-lg justify-center"><Link2 size={12}/> 已自动合并同类动作历史（如：史密斯卧推 + 平板卧推）</div></div>) : (<div className="flex flex-col items-center justify-center py-12 text-slate-300 border-2 border-dashed border-slate-100 rounded-2xl bg-slate-50/50"><TrendingUp size={40} className="mb-2 opacity-50"/><p className="text-xs font-bold">请选择一个动作</p></div>)}</div>
+                    <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden min-h-[400px] md:col-span-2"><div className="flex items-center gap-3 mb-4"><div className="p-2 bg-purple-50 rounded-full text-purple-500"><TrendingUp size={20}/></div><h3 className="font-bold text-slate-800">动作力量曲线</h3></div><div className="mb-6 relative"><select className="w-full p-4 pr-10 bg-slate-50 rounded-2xl font-bold text-slate-700 outline-none border border-slate-100 appearance-none text-sm shadow-sm focus:ring-2 ring-purple-100 transition-all" onChange={(e) => setSelectedExerciseForChart(e.target.value)} value={selectedExerciseForChart || ''}><option value="">-- 选择动作查看进步 --</option>{Object.entries(allHistoryExercises).map(([category, exercises]) => (<optgroup label={category} key={category}>{exercises.map(ex => <option key={ex.id} value={ex.id}>{ex.name}</option>)}</optgroup>))}</select><ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" size={16}/></div>{selectedExerciseForChart ? (<div className="animate-in"><SimpleLineChart data={selectedExData} color="#8b5cf6" suffix="kg" title="Max Weight" height={220} /><div className="grid grid-cols-2 gap-3 mt-6"><div className="bg-purple-50 p-3 rounded-2xl"><p className="text-[10px] font-bold text-purple-400 uppercase">历史最佳 (PR)</p><p className="text-xl font-black text-purple-600">{selectedExStats.pr} <span className="text-xs">kg</span></p></div><div className="bg-slate-50 p-3 rounded-2xl"><p className="text-[10px] font-bold text-slate-400 uppercase">累计次数</p><p className="text-xl font-black text-slate-600">{selectedExStats.totalReps} <span className="text-xs">reps</span></p></div></div>{selectedExStats.oneRM && (<div className="mt-3 bg-gradient-to-br from-yellow-50 to-orange-50 border border-yellow-200 p-4 rounded-2xl"><div className="flex items-center justify-between"><div className="flex items-center gap-2"><Trophy size={14} className="text-yellow-600"/><p className="text-[10px] font-bold text-yellow-700 uppercase">估算 1RM</p></div><p className="text-2xl font-black text-yellow-700">{selectedExStats.oneRM.value.toFixed(1)} <span className="text-xs font-bold">kg</span></p></div><p className="text-[10px] text-slate-500 mt-1">基于 {selectedExStats.oneRM.basis.weight}kg × {selectedExStats.oneRM.basis.reps} 次（{selectedExStats.oneRM.formula === 'direct' ? '直接' : selectedExStats.oneRM.formula === 'avg' ? 'Epley+Brzycki 平均' : selectedExStats.oneRM.formula === 'epley' ? 'Epley' : 'Brzycki'} 公式估算）</p></div>)}<div className="flex items-center gap-2 mt-4 text-[10px] text-slate-400 bg-slate-50 p-2 rounded-lg justify-center"><Link2 size={12}/> 已自动合并同类动作历史（如：史密斯卧推 + 平板卧推）</div></div>) : (<div className="flex flex-col items-center justify-center py-12 text-slate-300 border-2 border-dashed border-slate-100 rounded-2xl bg-slate-50/50"><TrendingUp size={40} className="mb-2 opacity-50"/><p className="text-xs font-bold">请选择一个动作</p></div>)}</div>
                 </div>
             )}
             {statsTab === 'calendar' && (
@@ -1016,7 +1425,7 @@ export default function App() {
                 <div className="pt-8 border-t border-slate-100"><h3 className="font-bold text-slate-800 mb-4">数据安全</h3><div className="grid grid-cols-2 gap-3 mb-4"><button onClick={exportData} className="flex items-center justify-center gap-2 p-4 bg-blue-50 text-blue-600 rounded-2xl font-bold hover:bg-blue-100 transition-colors active:scale-95"><Download size={20}/> 备份数据</button><button onClick={() => fileRef.current?.click()} className="flex items-center justify-center gap-2 p-4 bg-green-50 text-green-600 rounded-2xl font-bold hover:bg-green-100 transition-colors active:scale-95"><Upload size={20}/> 恢复数据</button><input type="file" ref={fileRef} style={{display:'none'}} accept=".json" onChange={handleFileImport} /></div><button onClick={() => { if(window.confirm('确定要清空所有历史记录吗？此操作不可恢复！')) { localStorage.clear(); window.location.reload(); } }} className="w-full py-4 text-red-400 font-bold text-sm hover:bg-red-50 rounded-xl transition-colors">⚠ 重置所有数据</button></div>
             </div>
           ) : (
-             <div className="space-y-4 pb-20"><div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm"><label className="text-xs font-bold text-slate-400 block mb-2 uppercase tracking-wider">计划名称</label><input value={plans[editingPlanId].name} onChange={(e) => updatePlanName(editingPlanId, e.target.value)} className="w-full text-xl font-black bg-transparent border-b-2 border-slate-100 pb-2 outline-none focus:border-orange-500 transition-colors" /></div><div className="md:grid md:grid-cols-2 md:gap-4 space-y-4 md:space-y-0">{plans[editingPlanId].exercises.map((ex, exIdx) => (<div key={ex.id} className="bg-white p-5 rounded-2xl border border-slate-100 relative group shadow-sm"><button onClick={() => deleteExercise(editingPlanId, ex.id)} className="absolute top-3 right-3 p-2 text-slate-300 hover:text-red-500 transition-colors"><X size={18}/></button><div className="grid grid-cols-12 gap-3 items-end"><div className="col-span-12 mb-2"><label className="text-[10px] font-bold text-slate-400 uppercase">动作名称</label><input value={ex.name} onChange={(e) => updateExercise(editingPlanId, exIdx, 'name', e.target.value)} className="w-full font-bold text-slate-800 bg-slate-50 p-3 rounded-xl mt-1 focus:ring-2 ring-orange-100 outline-none" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">组数</label><input type="number" value={ex.sets} onChange={(e) => updateExercise(editingPlanId, exIdx, 'sets', parseInt(e.target.value))} className="w-full bg-slate-50 p-2 rounded-lg text-center font-bold" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">目标</label><input value={ex.defaultReps} onChange={(e) => updateExercise(editingPlanId, exIdx, 'defaultReps', e.target.value)} className="w-full bg-slate-50 p-2 rounded-lg text-center font-bold" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">类型</label><select value={ex.unit} onChange={(e) => updateExercise(editingPlanId, exIdx, 'unit', e.target.value)} className="w-full bg-slate-50 p-2 rounded-lg text-xs font-bold appearance-none text-center"><option value="weight_reps">负重</option><option value="reps_only">自重</option><option value="time">计时</option></select></div></div></div>))}</div><button onClick={() => addExercise(editingPlanId)} className="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold hover:bg-slate-50 hover:text-slate-500 hover:border-slate-400 flex items-center justify-center gap-2 transition-all"><Plus size={20} /> 添加动作</button></div>
+             <div className="space-y-4 pb-20"><div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm"><label className="text-xs font-bold text-slate-400 block mb-2 uppercase tracking-wider">计划名称</label><input value={plans[editingPlanId].name} onChange={(e) => updatePlanName(editingPlanId, e.target.value)} className="w-full text-xl font-black bg-transparent border-b-2 border-slate-100 pb-2 outline-none focus:border-orange-500 transition-colors" /></div><div className="md:grid md:grid-cols-2 md:gap-4 space-y-4 md:space-y-0">{plans[editingPlanId].exercises.map((ex, exIdx) => (<div key={ex.id} className="bg-white p-5 rounded-2xl border border-slate-100 relative group shadow-sm"><button onClick={() => deleteExercise(editingPlanId, ex.id)} className="absolute top-3 right-3 p-2 text-slate-300 hover:text-red-500 transition-colors"><X size={18}/></button><div className="grid grid-cols-12 gap-3 items-end"><div className="col-span-12 mb-2"><label className="text-[10px] font-bold text-slate-400 uppercase">动作名称</label><input value={ex.name} onChange={(e) => updateExercise(editingPlanId, exIdx, 'name', e.target.value)} className="w-full font-bold text-slate-800 bg-slate-50 p-3 rounded-xl mt-1 focus:ring-2 ring-orange-100 outline-none" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">组数</label><input type="text" inputMode="decimal" value={ex.sets} onChange={(e) => updateExercise(editingPlanId, exIdx, 'sets', parseInt(e.target.value))} className="w-full bg-slate-50 p-2 rounded-lg text-center font-bold" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">目标</label><input value={ex.defaultReps} onChange={(e) => updateExercise(editingPlanId, exIdx, 'defaultReps', e.target.value)} className="w-full bg-slate-50 p-2 rounded-lg text-center font-bold" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">类型</label><select value={ex.unit} onChange={(e) => updateExercise(editingPlanId, exIdx, 'unit', e.target.value)} className="w-full bg-slate-50 p-2 rounded-lg text-xs font-bold appearance-none text-center"><option value="weight_reps">负重</option><option value="reps_only">自重</option><option value="time">计时</option></select></div></div></div>))}</div><button onClick={() => addExercise(editingPlanId)} className="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold hover:bg-slate-50 hover:text-slate-500 hover:border-slate-400 flex items-center justify-center gap-2 transition-all"><Plus size={20} /> 添加动作</button></div>
           )}
       </div>
   );
@@ -1044,6 +1453,8 @@ export default function App() {
       {renderStatsDetailModal()}
       {renderTimerModal()}
       {renderWorkoutDetailModal()}
+      {renderCelebrationModal()}
+      {renderUndoToast()}
       {activeTab !== 'workout' && <nav className="bg-white/90 dark:bg-slate-900/90 backdrop-blur-lg border-t border-slate-200 dark:border-slate-800 fixed bottom-0 w-full md:max-w-3xl lg:max-w-5xl left-0 right-0 mx-auto flex justify-around py-4 pb-6 z-20 shadow-[0_-5px_10px_rgba(0,0,0,0.02)] pb-safe">
           <button onClick={() => setActiveTab('home')} className={`flex flex-col items-center gap-1 transition-colors ${activeTab === 'home' ? 'text-orange-500' : 'text-slate-400'}`}><Activity size={24} strokeWidth={activeTab === 'home' ? 2.5 : 2} /></button>
           <button onClick={() => setActiveTab('stats')} className={`flex flex-col items-center gap-1 transition-colors ${activeTab === 'stats' ? 'text-orange-500' : 'text-slate-400'}`}><BarChart3 size={24} strokeWidth={activeTab === 'stats' ? 2.5 : 2} /></button>

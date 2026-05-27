@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# 误生成的嵌套 clone 目录（GitHub Desktop 失败 clone 残留）
+/Laodazhuang/
