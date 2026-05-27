@@ -8,17 +8,20 @@ import {
   TrendingUp, TrendingDown, Info, Repeat, AlertTriangle, Trophy, Target, PieChart, PlusCircle, Scale,
   MoreVertical, Hammer, LayoutGrid, LineChart, Hourglass, Gift, Heart, Sparkles, Moon, Sun, Sunrise,
   BarChart4, Minus, Footprints, History, Coffee, Ghost, Play, Pause, RotateCcw,
-  CalendarCheck, MapPin, RefreshCw, Link2, Mountain
+  CalendarCheck, MapPin, RefreshCw, Link2, Mountain, Cloud, CloudUpload, CloudDownload, Eye, EyeOff
 } from 'lucide-react';
 import { MAIN_PLANS_DEFAULT } from './constants';
 import { Plan, HistoryItemType, ExerciseHistoryRecord, BodyStat, WorkoutSetLog, ChartDataPoint, Exercise, RewardRecord } from './types';
 import { getLocalDateString, getMonthString, superParse, parseIndex, formatTime, getWeekStartString } from './utils';
 import SmartInput from './components/SmartInput';
 import SimpleLineChart from './components/SimpleLineChart';
+import DualLineChart from './components/DualLineChart';
 import HistoryItem from './components/HistoryItem';
 import CalendarHeatmap from './components/CalendarHeatmap';
 import { haptics } from './lib/haptics';
 import { estimateSet, OneRMResult } from './lib/oneRepMax';
+import { saveWithMirror, recoverMissingKeys, runMigrations, daysSinceLastBackup, markBackupDone } from './lib/storage';
+import * as gistSync from './lib/gistSync';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('home');
@@ -101,6 +104,20 @@ export default function App() {
   // D5: 训练完成庆祝弹窗（含 PR 列表）
   const [celebration, setCelebration] = useState<{ duration: number; volume: number; prs: Array<{ name: string; weight: number; prevPR: number }> } | null>(null);
 
+  // A2: 备份提醒横幅本会话内已忽略
+  const [backupBannerDismissed, setBackupBannerDismissed] = useState(false);
+
+  // A3: Gist 同步 UI 状态
+  const [gistSettings, setGistSettings] = useState(() => gistSync.getSettings());
+  const [gistTokenInput, setGistTokenInput] = useState('');
+  const [showToken, setShowToken] = useState(false);
+  const [gistBusy, setGistBusy] = useState<'idle' | 'pushing' | 'pulling'>('idle');
+  const [gistMessage, setGistMessage] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
+
+  // D8: 历史搜索/筛选
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [historyFilter, setHistoryFilter] = useState<'all' | 'workout' | 'cardio' | 'rest'>('all');
+
   // --- Helpers for Fuzzy Matching ---
   const normalizeExerciseName = (name: string) => {
       if (!name) return '';
@@ -123,6 +140,37 @@ export default function App() {
   // --- Analytics Calculations ---
   
   const volumeDataRecent = useMemo<ChartDataPoint[]>(() => history.filter(h => h.type === 'workout' && h.metrics?.volume && h.metrics.volume > 0).slice(0, 15).reverse().map(h => ({ date: h.date.slice(5), value: h.metrics!.volume!, timestamp: h.timestamp })), [history]);
+
+  // E3: 体重 vs 容量叠图数据 — 按日期对齐，最近 30 天
+  const dualChartData = useMemo(() => {
+    const cutoff = Date.now() - 30 * 86400000;
+    // 体重：每天保留最早一次记录（早晨称重最稳）
+    const weightByDate: Record<string, ChartDataPoint> = {};
+    bodyStats.forEach(s => {
+      if (s.timestamp < cutoff) return;
+      const w = parseFloat(s.weight);
+      if (!w) return;
+      const d = s.date;
+      if (!weightByDate[d] || s.timestamp < weightByDate[d].timestamp!) {
+        weightByDate[d] = { date: d.slice(5), value: w, timestamp: s.timestamp };
+      }
+    });
+    // 容量：同一天多次训练取总和（吨）
+    const volumeByDate: Record<string, ChartDataPoint> = {};
+    history.forEach(h => {
+      if (h.type !== 'workout' || h.timestamp < cutoff) return;
+      const v = h.metrics?.volume;
+      if (!v) return;
+      const d = h.date;
+      const inTons = v / 1000;
+      if (volumeByDate[d]) volumeByDate[d].value += inTons;
+      else volumeByDate[d] = { date: d.slice(5), value: inTons, timestamp: h.timestamp };
+    });
+    return {
+      weight: Object.values(weightByDate).sort((a, b) => (a.timestamp! - b.timestamp!)),
+      volume: Object.values(volumeByDate).sort((a, b) => (a.timestamp! - b.timestamp!)),
+    };
+  }, [history, bodyStats]);
   const weightDataRecent = useMemo<ChartDataPoint[]>(() => bodyStats.filter(s => s.weight).slice(0, 15).reverse().map(s => ({ date: s.date.slice(5), value: parseFloat(s.weight), timestamp: s.timestamp })), [bodyStats]);
   
   const totalDurationMinutes = useMemo(() => history.filter(h => h.type === 'workout').reduce((acc, curr) => acc + (curr.metrics?.duration || 0), 0), [history]);
@@ -441,15 +489,33 @@ export default function App() {
   }, [isManualTimerRunning]);
 
   useEffect(() => {
-    const load = (key: string, setter: (val: any) => void) => { const data = localStorage.getItem(key); if (data) { let parsed = superParse(data, []); if (Array.isArray(parsed)) { parsed = parsed.map((item, index) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); } setter(parsed); return parsed; } return []; };
-    const loadObj = (key: string, setter: (val: any) => void) => { const data = localStorage.getItem(key); if (data) setter(superParse(data, {})); };
-    const loadNum = (key: string, setter: (val: any) => void) => { const data = localStorage.getItem(key); if (data) setter(parseIndex(data)); };
+    (async () => {
+      // A4: schema 版本检查 + 未来迁移钩子
+      runMigrations();
 
-    loadNum('fitness_plan_index_v6', setCurrentPlanIndex);
-    const loadedHistory = load('fitness_history_v6', setHistory);
-    load('fitness_stats_v6', setBodyStats);
-    load('fitness_rewards_v6', setRewards);
-    loadObj('fitness_ex_history_v6', setExerciseHistory);
+      // A1: 启动时检查关键 key 是否被 iOS 清掉，从 IndexedDB 镜像拉回
+      const recovered = await recoverMissingKeys([
+        'fitness_history_v6',
+        'fitness_plans_v8',
+        'fitness_stats_v6',
+        'fitness_rewards_v6',
+        'fitness_ex_history_v6',
+        'fitness_legacy_map_v1',
+        'fitness_plan_index_v6',
+      ]);
+      if (recovered.length > 0) {
+        console.log('[storage] recovered from IndexedDB:', recovered);
+      }
+
+      const load = (key: string, setter: (val: any) => void) => { const data = localStorage.getItem(key); if (data) { let parsed = superParse(data, []); if (Array.isArray(parsed)) { parsed = parsed.map((item, index) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); } setter(parsed); return parsed; } return []; };
+      const loadObj = (key: string, setter: (val: any) => void) => { const data = localStorage.getItem(key); if (data) setter(superParse(data, {})); };
+      const loadNum = (key: string, setter: (val: any) => void) => { const data = localStorage.getItem(key); if (data) setter(parseIndex(data)); };
+
+      loadNum('fitness_plan_index_v6', setCurrentPlanIndex);
+      const loadedHistory = load('fitness_history_v6', setHistory);
+      load('fitness_stats_v6', setBodyStats);
+      load('fitness_rewards_v6', setRewards);
+      loadObj('fitness_ex_history_v6', setExerciseHistory);
     loadObj('fitness_legacy_map_v1', setLegacyExerciseMap);
     
     if (loadedHistory && loadedHistory.length > 0) {
@@ -506,7 +572,8 @@ export default function App() {
           }
         }
       }
-    } catch (e) { localStorage.removeItem('fitness_active_workout_v1'); }
+      } catch (e) { localStorage.removeItem('fitness_active_workout_v1'); }
+    })();
   }, []);
 
   // 状态保活：训练状态变化时自动写盘
@@ -525,7 +592,10 @@ export default function App() {
     }
   }, [activeWorkout, workoutLogs, workoutStartTime, expandedExId]);
 
-  const saveToLocal = (key: string, data: any) => { try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { alert("存储空间不足"); } };
+  const saveToLocal = (key: string, data: any) => {
+    try { saveWithMirror(key, data); }
+    catch (e) { alert("存储空间不足"); }
+  };
   const startRestTimer = (seconds = 90) => { setRestTimer(seconds); setIsResting(true); };
   const stopRestTimer = () => { setIsResting(false); setRestTimer(0); };
   const adjustRestTime = (delta: number) => { setRestTimer(prev => Math.max(0, prev + delta)); };
@@ -791,6 +861,66 @@ export default function App() {
   const exportData = () => {
       const d = { history, plans, stats: bodyStats, exHistory: exerciseHistory, planIndex: currentPlanIndex, rewards, legacyMap: legacyExerciseMap };
       const b = new Blob([JSON.stringify(d)], {type:'application/json'}); const u = URL.createObjectURL(b); const a = document.createElement('a'); a.href=u; a.download=`LaoDaZhuang_${getLocalDateString()}.json`; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      markBackupDone();
+  };
+
+  // A3: Gist 同步辅助
+  const handleGistSaveToken = () => {
+    const t = gistTokenInput.trim();
+    if (!t) { setGistMessage({ kind: 'error', text: '请粘贴 Token' }); return; }
+    if (!t.startsWith('ghp_') && !t.startsWith('github_pat_')) {
+      setGistMessage({ kind: 'error', text: 'Token 格式不对，应以 ghp_ 或 github_pat_ 开头' });
+      return;
+    }
+    gistSync.saveToken(t);
+    setGistTokenInput('');
+    setGistSettings(gistSync.getSettings());
+    setGistMessage({ kind: 'success', text: 'Token 已保存（仅存浏览器本地）' });
+  };
+
+  const handleGistPush = async () => {
+    setGistBusy('pushing'); setGistMessage(null);
+    try {
+      const blob = { history, plans, stats: bodyStats, exHistory: exerciseHistory, planIndex: currentPlanIndex, rewards, legacyMap: legacyExerciseMap };
+      const { gistId } = await gistSync.pushToGist(blob);
+      setGistSettings(gistSync.getSettings());
+      markBackupDone();
+      setGistMessage({ kind: 'success', text: `已上传到 Gist (${gistId.slice(0, 7)}...)` });
+      haptics.success();
+    } catch (e: any) {
+      setGistMessage({ kind: 'error', text: e.message || '上传失败' });
+      haptics.warning();
+    } finally { setGistBusy('idle'); }
+  };
+
+  const handleGistPull = async () => {
+    if (!confirm('从云端拉回会覆盖当前本地数据，确定吗？\n（建议先点"上传到云端"备份当前状态）')) return;
+    setGistBusy('pulling'); setGistMessage(null);
+    try {
+      const blob = await gistSync.pullFromGist();
+      gistSync.applyBackupBlob(blob);
+      setGistSettings(gistSync.getSettings());
+      // 重新加载到 state
+      setHistory(blob.history || []);
+      setPlans(blob.plans || MAIN_PLANS_DEFAULT);
+      setBodyStats(blob.stats || []);
+      setExerciseHistory(blob.exHistory || {});
+      setCurrentPlanIndex(typeof blob.planIndex === 'number' ? blob.planIndex : 0);
+      setRewards(blob.rewards || []);
+      setLegacyExerciseMap(blob.legacyMap || {});
+      setGistMessage({ kind: 'success', text: '云端数据已恢复' });
+      haptics.success();
+    } catch (e: any) {
+      setGistMessage({ kind: 'error', text: e.message || '拉取失败' });
+      haptics.warning();
+    } finally { setGistBusy('idle'); }
+  };
+
+  const handleGistDisconnect = () => {
+    if (!confirm('断开后会清除本地保存的 Token 和 Gist ID，但云端数据保留。继续吗？')) return;
+    gistSync.clearSettings();
+    setGistSettings(gistSync.getSettings());
+    setGistMessage(null);
   };
   
   const handleFileImport = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -800,28 +930,28 @@ export default function App() {
           try {
               const d = superParse(ev.target?.result, null); if(!d) throw new Error("Empty");
               let importedHistory: HistoryItemType[] = []; let importedPlans = plans;
-              if(d.history) { importedHistory = superParse(d.history, []).map((item: any, index: number) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); localStorage.setItem('fitness_history_v6', JSON.stringify(importedHistory)); setHistory(importedHistory); }
-              if(d.stats) { const parsedStats = superParse(d.stats, []).map((item: any, index: number) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); localStorage.setItem('fitness_stats_v6', JSON.stringify(parsedStats)); setBodyStats(parsedStats); }
-              if (d.rewards) { const parsedRewards = superParse(d.rewards, []).map((item: any, index: number) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); localStorage.setItem('fitness_rewards_v6', JSON.stringify(parsedRewards)); setRewards(parsedRewards); }
-              if(d.exHistory) { localStorage.setItem('fitness_ex_history_v6', JSON.stringify(d.exHistory)); setExerciseHistory(superParse(d.exHistory, {})); }
+              if(d.history) { importedHistory = superParse(d.history, []).map((item: any, index: number) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); saveWithMirror('fitness_history_v6', importedHistory); setHistory(importedHistory); }
+              if(d.stats) { const parsedStats = superParse(d.stats, []).map((item: any, index: number) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); saveWithMirror('fitness_stats_v6', parsedStats); setBodyStats(parsedStats); }
+              if (d.rewards) { const parsedRewards = superParse(d.rewards, []).map((item: any, index: number) => { if (!item.timestamp) return { ...item, timestamp: Date.now() - (index * 1000) }; return item; }); saveWithMirror('fitness_rewards_v6', parsedRewards); setRewards(parsedRewards); }
+              if(d.exHistory) { const parsedExH = superParse(d.exHistory, {}); saveWithMirror('fitness_ex_history_v6', parsedExH); setExerciseHistory(parsedExH); }
 
               const extractedLegacyMap = { ...legacyExerciseMap }; let foundLegacy = 0;
               if (d.plans) { const oldPlans: Plan[] = superParse(d.plans, []); oldPlans.forEach(p => { p.exercises.forEach(ex => { if (!extractedLegacyMap[ex.id]) { extractedLegacyMap[ex.id] = ex.name; foundLegacy++; } }); }); }
               if (d.legacyMap) { Object.assign(extractedLegacyMap, d.legacyMap); }
-              setLegacyExerciseMap(extractedLegacyMap); localStorage.setItem('fitness_legacy_map_v1', JSON.stringify(extractedLegacyMap));
+              setLegacyExerciseMap(extractedLegacyMap); saveWithMirror('fitness_legacy_map_v1', extractedLegacyMap);
 
-              if(d.plans) { 
+              if(d.plans) {
                   const shouldOverwrite = window.confirm("检测到备份文件中包含【旧训练计划】。\n\n❓ 是否覆盖当前的【新计划】？\n👉 点击【取消】(Cancel)：保留现在的「新计划」，只恢复历史记录。\n👉 点击【确定】(OK)：恢复备份里的旧计划。");
-                  if (shouldOverwrite) { localStorage.setItem('fitness_plans_v8', JSON.stringify(d.plans)); importedPlans = superParse(d.plans, []); setPlans(importedPlans); } 
-                  else { localStorage.setItem('fitness_plans_v8', JSON.stringify(plans)); }
+                  if (shouldOverwrite) { const parsedPlans = superParse(d.plans, []); saveWithMirror('fitness_plans_v8', parsedPlans); importedPlans = parsedPlans; setPlans(importedPlans); }
+                  else { saveWithMirror('fitness_plans_v8', plans); }
               }
 
               if (importedHistory && importedHistory.length > 0) {
                   const lastWorkout = importedHistory.find(h => h.type === 'workout');
                   if (lastWorkout && lastWorkout.planName) {
                       const lastPlanIndex = importedPlans.findIndex(p => p.name === lastWorkout.planName);
-                      if (lastPlanIndex !== -1) { const nextIdx = (lastPlanIndex + 1) % importedPlans.length; localStorage.setItem('fitness_plan_index_v6', nextIdx.toString()); setCurrentPlanIndex(nextIdx); } 
-                      else { localStorage.setItem('fitness_plan_index_v6', '0'); setCurrentPlanIndex(0); }
+                      if (lastPlanIndex !== -1) { const nextIdx = (lastPlanIndex + 1) % importedPlans.length; saveWithMirror('fitness_plan_index_v6', nextIdx); setCurrentPlanIndex(nextIdx); }
+                      else { saveWithMirror('fitness_plan_index_v6', 0); setCurrentPlanIndex(0); }
                   }
               }
               alert(`✅ 数据恢复成功！\n已找回 ${foundLegacy} 个旧动作名称，图表将自动合并。`); e.target.value = '';
@@ -1374,6 +1504,39 @@ export default function App() {
              <div className="flex gap-3"><button onClick={() => openRestDayModal()} className="flex-1 flex items-center justify-center gap-2 bg-white/20 hover:bg-white/30 p-3 rounded-2xl backdrop-blur-sm transition-all active:scale-95 text-white"><Ghost className="w-5 h-5" /> <span className="text-sm font-bold">我要请假</span></button><button onClick={startRewardFlow} className="flex-1 flex items-center justify-center gap-2 bg-rose-500/20 hover:bg-rose-500/30 text-rose-100 p-3 rounded-2xl backdrop-blur-sm transition-all active:scale-95 ring-1 ring-white/10 shadow-sm" title="给自己个奖励"><Gift className="w-5 h-5" /> <span className="text-sm font-bold">给自己奖励</span></button></div>
           </div>
         </div>
+        {/* A2: 7 天没备份的黄色提醒横幅 */}
+        {!backupBannerDismissed && history.length > 0 && daysSinceLastBackup() >= 7 && (
+          <div className="bg-yellow-50 border border-yellow-200 rounded-2xl p-4 flex items-start gap-3 animate-in">
+            <div className="w-9 h-9 rounded-full bg-yellow-100 text-yellow-600 flex items-center justify-center shrink-0">
+              <AlertTriangle size={18}/>
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-bold text-yellow-800">建议导出一次备份</p>
+              <p className="text-xs text-yellow-700/80 mt-0.5 leading-relaxed">
+                {(() => {
+                  const d = daysSinceLastBackup();
+                  return d === Infinity
+                    ? '检测到你从未导出过备份。iOS 长时间不打开 PWA 可能清掉本地数据。'
+                    : `已经 ${d} 天没备份了。建议存到 iCloud Drive，换设备或卸载也能恢复。`;
+                })()}
+              </p>
+              <div className="flex gap-2 mt-3">
+                <button
+                  onClick={() => { exportData(); setBackupBannerDismissed(true); haptics.medium(); }}
+                  className="px-3 py-1.5 rounded-lg bg-yellow-500 text-white text-xs font-bold active:scale-95 transition-all flex items-center gap-1"
+                >
+                  <Download size={12}/> 立即备份
+                </button>
+                <button
+                  onClick={() => setBackupBannerDismissed(true)}
+                  className="px-3 py-1.5 rounded-lg bg-white/80 text-yellow-700 text-xs font-bold active:scale-95 transition-all"
+                >
+                  稍后再说
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="px-1">
            <div className="flex items-center justify-between mb-4"><h3 className="text-slate-800 font-bold text-lg">最近记录</h3><button onClick={()=>setActiveTab('stats')} className="text-orange-500 text-xs font-bold bg-orange-50 dark:bg-orange-900/20 px-3 py-1.5 rounded-full">查看全部</button></div>
            {history.length === 0 ? (<div className="text-center py-12 text-slate-400 border-2 border-dashed border-slate-200 rounded-2xl bg-slate-50"><Activity className="mx-auto mb-2 opacity-20" size={32}/><p className="text-sm">暂无记录，今天是个开始的好日子！</p></div>) : (<div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">{history.slice(0,6).map((h,i) => <HistoryItem key={h.timestamp || i} item={h} onDelete={setDeleteConfirmItem} onEdit={(item) => item.type === 'workout' ? setViewingHistoryItem(item) : openRestDayModal(item)} />)}</div>)}
@@ -1411,13 +1574,92 @@ export default function App() {
                     {bodyStats[0]?.bodyFat && <div className="text-xs font-bold text-slate-400 mb-4 px-1">最新体脂: <span className="text-blue-500">{bodyStats[0].bodyFat}%</span></div>}
                     <SimpleLineChart data={weightDataRecent} color="#3b82f6" suffix="kg" title="Current Weight" /><div className="mt-4 pt-4 border-t border-slate-50 flex gap-2"><input type="text" inputMode="decimal" className="flex-1 bg-slate-50 rounded-xl px-4 py-2 text-sm font-bold text-slate-700 outline-none focus:ring-2 ring-blue-100" placeholder="快速记录今日体重..." onBlur={e=>{if(e.target.value){const ns=[{date:getLocalDateString(),weight:e.target.value, timestamp: Date.now()},...bodyStats];setBodyStats(ns);saveToLocal('fitness_stats_v6',ns);e.target.value='';}}} /></div></div>
                     <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden"><div className="flex items-center gap-3 mb-6"><div className="p-2 bg-orange-50 rounded-full text-orange-500"><BarChart3 size={20}/></div><h3 className="font-bold text-slate-800">训练容量趋势</h3></div><SimpleLineChart data={volumeDataRecent} color="#f97316" suffix="" title="Total Volume" /><p className="text-[10px] text-slate-400 text-center mt-4">容量 = 重量 × 次数 (反映训练总量)</p></div>
+                    {/* E3: 体重 vs 容量 叠图（最近 30 天） */}
+                    <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden md:col-span-2">
+                      <div className="flex items-center gap-3 mb-4">
+                        <div className="p-2 bg-purple-50 rounded-full text-purple-500"><Link2 size={20}/></div>
+                        <div>
+                          <h3 className="font-bold text-slate-800">体重 × 容量 关联</h3>
+                          <p className="text-[10px] text-slate-400">最近 30 天 · 看减脂期容量是不是同时在涨</p>
+                        </div>
+                      </div>
+                      <DualLineChart
+                        primary={dualChartData.weight}
+                        secondary={dualChartData.volume}
+                        primaryColor="#3b82f6"
+                        secondaryColor="#f97316"
+                        primaryLabel="体重"
+                        secondaryLabel="容量"
+                        primarySuffix="kg"
+                        secondarySuffix="t"
+                        height={220}
+                      />
+                    </div>
                     <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden min-h-[400px] md:col-span-2"><div className="flex items-center gap-3 mb-4"><div className="p-2 bg-purple-50 rounded-full text-purple-500"><TrendingUp size={20}/></div><h3 className="font-bold text-slate-800">动作力量曲线</h3></div><div className="mb-6 relative"><select className="w-full p-4 pr-10 bg-slate-50 rounded-2xl font-bold text-slate-700 outline-none border border-slate-100 appearance-none text-sm shadow-sm focus:ring-2 ring-purple-100 transition-all" onChange={(e) => setSelectedExerciseForChart(e.target.value)} value={selectedExerciseForChart || ''}><option value="">-- 选择动作查看进步 --</option>{Object.entries(allHistoryExercises).map(([category, exercises]) => (<optgroup label={category} key={category}>{exercises.map(ex => <option key={ex.id} value={ex.id}>{ex.name}</option>)}</optgroup>))}</select><ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" size={16}/></div>{selectedExerciseForChart ? (<div className="animate-in"><SimpleLineChart data={selectedExData} color="#8b5cf6" suffix="kg" title="Max Weight" height={220} /><div className="grid grid-cols-2 gap-3 mt-6"><div className="bg-purple-50 p-3 rounded-2xl"><p className="text-[10px] font-bold text-purple-400 uppercase">历史最佳 (PR)</p><p className="text-xl font-black text-purple-600">{selectedExStats.pr} <span className="text-xs">kg</span></p></div><div className="bg-slate-50 p-3 rounded-2xl"><p className="text-[10px] font-bold text-slate-400 uppercase">累计次数</p><p className="text-xl font-black text-slate-600">{selectedExStats.totalReps} <span className="text-xs">reps</span></p></div></div>{selectedExStats.oneRM && (<div className="mt-3 bg-gradient-to-br from-yellow-50 to-orange-50 border border-yellow-200 p-4 rounded-2xl"><div className="flex items-center justify-between"><div className="flex items-center gap-2"><Trophy size={14} className="text-yellow-600"/><p className="text-[10px] font-bold text-yellow-700 uppercase">估算 1RM</p></div><p className="text-2xl font-black text-yellow-700">{selectedExStats.oneRM.value.toFixed(1)} <span className="text-xs font-bold">kg</span></p></div><p className="text-[10px] text-slate-500 mt-1">基于 {selectedExStats.oneRM.basis.weight}kg × {selectedExStats.oneRM.basis.reps} 次（{selectedExStats.oneRM.formula === 'direct' ? '直接' : selectedExStats.oneRM.formula === 'avg' ? 'Epley+Brzycki 平均' : selectedExStats.oneRM.formula === 'epley' ? 'Epley' : 'Brzycki'} 公式估算）</p></div>)}<div className="flex items-center gap-2 mt-4 text-[10px] text-slate-400 bg-slate-50 p-2 rounded-lg justify-center"><Link2 size={12}/> 已自动合并同类动作历史（如：史密斯卧推 + 平板卧推）</div></div>) : (<div className="flex flex-col items-center justify-center py-12 text-slate-300 border-2 border-dashed border-slate-100 rounded-2xl bg-slate-50/50"><TrendingUp size={40} className="mb-2 opacity-50"/><p className="text-xs font-bold">请选择一个动作</p></div>)}</div>
                 </div>
             )}
             {statsTab === 'calendar' && (
                  <div className="space-y-6 animate-in md:grid md:grid-cols-2 md:gap-4 md:space-y-0">
                      <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm"><div className="flex items-center justify-between mb-4 px-1"><h3 className="font-bold text-slate-800">热力图</h3><div className="bg-slate-100 p-0.5 rounded-lg flex text-[10px] font-bold"><button onClick={() => setHeatmapMode('workout')} className={`px-3 py-1.5 rounded-md transition-all ${heatmapMode === 'workout' ? 'bg-white shadow-sm text-slate-800' : 'text-slate-400'}`}>训练</button><button onClick={() => setHeatmapMode('reward')} className={`px-3 py-1.5 rounded-md transition-all ${heatmapMode === 'reward' ? 'bg-white shadow-sm text-rose-500' : 'text-slate-400'}`}>奖励</button></div></div><CalendarHeatmap history={history} rewards={rewards} dataType={heatmapMode} onSelectDate={setSelectedDate} /></div>
-                     <div className="space-y-3"><h3 className="font-bold text-slate-800 px-1">近期动态</h3>{history.slice(0, 10).map((h, i) => <HistoryItem key={h.timestamp || i} item={h} onDelete={setDeleteConfirmItem} onEdit={(item) => item.type === 'workout' ? setViewingHistoryItem(item) : openRestDayModal(item)} />)}{history.length === 0 && <p className="text-center text-slate-400 text-sm py-8">暂无记录</p>}</div>
+                     <div className="space-y-3">
+                       <div className="flex items-center justify-between px-1">
+                         <h3 className="font-bold text-slate-800">近期动态</h3>
+                         <span className="text-[10px] font-bold text-slate-400">共 {history.length} 条</span>
+                       </div>
+
+                       {/* D8: 搜索 + 类型筛选 */}
+                       <div className="bg-white rounded-2xl border border-slate-100 p-3 space-y-2 shadow-sm">
+                         <input
+                           type="text"
+                           value={historyQuery}
+                           onChange={(e) => setHistoryQuery(e.target.value)}
+                           placeholder="搜索动作名 / 计划名 / 备注"
+                           className="w-full bg-slate-50 px-3 py-2 rounded-lg text-xs font-medium outline-none focus:ring-2 ring-orange-100 border border-slate-100"
+                         />
+                         <div className="flex gap-1">
+                           {([
+                             ['all', '全部', 'text-slate-700'],
+                             ['workout', '力量', 'text-orange-500'],
+                             ['cardio', '爬坡', 'text-emerald-500'],
+                             ['rest', '休息', 'text-blue-500'],
+                           ] as const).map(([key, label, cls]) => (
+                             <button
+                               key={key}
+                               onClick={() => setHistoryFilter(key)}
+                               className={`flex-1 px-2 py-1.5 rounded-lg text-[10px] font-bold transition-all ${historyFilter === key ? `bg-slate-900 text-white shadow-sm` : `bg-slate-50 ${cls} hover:bg-slate-100`}`}
+                             >
+                               {label}
+                             </button>
+                           ))}
+                         </div>
+                       </div>
+
+                       {(() => {
+                         const q = historyQuery.trim().toLowerCase();
+                         const filtered = history.filter(h => {
+                           if (historyFilter === 'workout' && h.type !== 'workout') return false;
+                           if (historyFilter === 'cardio' && h.type !== 'cardio') return false;
+                           if (historyFilter === 'rest' && h.type !== 'rest' && h.type !== 'lazy') return false;
+                           if (!q) return true;
+                           if ((h.planName || '').toLowerCase().includes(q)) return true;
+                           if ((h.note || '').toLowerCase().includes(q)) return true;
+                           if ((h.metrics?.note || '').toLowerCase().includes(q)) return true;
+                           if (h.logs) {
+                             for (const exId of Object.keys(h.logs)) {
+                               const exName = getExerciseNameById(exId).toLowerCase();
+                               if (exName.includes(q)) return true;
+                             }
+                           }
+                           return false;
+                         });
+                         if (filtered.length === 0) {
+                           return <p className="text-center text-slate-400 text-sm py-8">{history.length === 0 ? '暂无记录' : '没有匹配的记录'}</p>;
+                         }
+                         return filtered.slice(0, 30).map((h, i) => (
+                           <HistoryItem key={h.timestamp || i} item={h} onDelete={setDeleteConfirmItem} onEdit={(item) => item.type === 'workout' ? setViewingHistoryItem(item) : openRestDayModal(item)} />
+                         ));
+                       })()}
+                     </div>
                  </div>
             )}
          </div>
@@ -1439,7 +1681,94 @@ export default function App() {
           {editingPlanId===null ? (
             <div className="space-y-6">
                 <div className="space-y-3 md:grid md:grid-cols-2 md:gap-4 md:space-y-0"><div className="flex justify-between items-center px-1 md:col-span-2"><h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">训练计划管理</h3><button onClick={() => { if(confirm('确认将计划重置为最新的默认计划吗？\n（你的历史记录和体重数据【不会】丢失）')) { updatePlans(MAIN_PLANS_DEFAULT); alert('✅ 计划已更新！'); } }} className="text-[10px] font-bold text-orange-500 bg-orange-50 px-2 py-1 rounded-lg flex items-center gap-1"><RefreshCw size={10}/> 重置/更新计划</button></div>{plans.map((plan, idx) => (<div key={plan.id} className="bg-white p-5 rounded-2xl border border-slate-100 flex justify-between items-center active:scale-[0.98] transition-all shadow-sm"><div onClick={() => setEditingPlanId(idx)} className="flex-1 cursor-pointer"><h3 className="font-bold text-lg text-slate-800">{plan.name}</h3><p className="text-sm text-slate-400 mt-1">{plan.exercises.length} 个动作</p></div><div className="flex items-center gap-2"><button onClick={() => setEditingPlanId(idx)} className="w-10 h-10 bg-slate-50 rounded-full flex items-center justify-center text-slate-400 hover:text-orange-500 hover:bg-orange-50"><Edit3 size={18} /></button><button onClick={() => setDeleteConfirmItem({ type: 'plan', data: plan, index: idx })} className="w-10 h-10 bg-slate-50 rounded-full flex items-center justify-center text-slate-400 hover:text-red-500 hover:bg-red-50"><Trash2 size={18} /></button></div></div>))}<button onClick={addNewPlan} className="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold hover:bg-slate-50 hover:text-slate-500 hover:border-slate-400 flex items-center justify-center gap-2 transition-all md:col-span-2"><PlusCircle size={20} /> 新建训练日</button></div>
-                <div className="pt-8 border-t border-slate-100"><h3 className="font-bold text-slate-800 mb-4">数据安全</h3><div className="grid grid-cols-2 gap-3 mb-4"><button onClick={exportData} className="flex items-center justify-center gap-2 p-4 bg-blue-50 text-blue-600 rounded-2xl font-bold hover:bg-blue-100 transition-colors active:scale-95"><Download size={20}/> 备份数据</button><button onClick={() => fileRef.current?.click()} className="flex items-center justify-center gap-2 p-4 bg-green-50 text-green-600 rounded-2xl font-bold hover:bg-green-100 transition-colors active:scale-95"><Upload size={20}/> 恢复数据</button><input type="file" ref={fileRef} style={{display:'none'}} accept=".json" onChange={handleFileImport} /></div><button onClick={() => { if(window.confirm('确定要清空所有历史记录吗？此操作不可恢复！')) { localStorage.clear(); window.location.reload(); } }} className="w-full py-4 text-red-400 font-bold text-sm hover:bg-red-50 rounded-xl transition-colors">⚠ 重置所有数据</button></div>
+                <div className="pt-8 border-t border-slate-100">
+                  <h3 className="font-bold text-slate-800 mb-4">数据安全</h3>
+                  <div className="grid grid-cols-2 gap-3 mb-4">
+                    <button onClick={exportData} className="flex items-center justify-center gap-2 p-4 bg-blue-50 text-blue-600 rounded-2xl font-bold hover:bg-blue-100 transition-colors active:scale-95"><Download size={20}/> 备份数据</button>
+                    <button onClick={() => fileRef.current?.click()} className="flex items-center justify-center gap-2 p-4 bg-green-50 text-green-600 rounded-2xl font-bold hover:bg-green-100 transition-colors active:scale-95"><Upload size={20}/> 恢复数据</button>
+                    <input type="file" ref={fileRef} style={{display:'none'}} accept=".json" onChange={handleFileImport} />
+                  </div>
+
+                  {/* A3: GitHub Gist 跨设备同步 */}
+                  <div className="bg-white rounded-2xl border border-slate-100 p-5 mb-4 shadow-sm">
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-9 h-9 rounded-xl bg-slate-100 text-slate-600 flex items-center justify-center"><Cloud size={18}/></div>
+                        <div>
+                          <h4 className="font-bold text-slate-800 text-sm">GitHub Gist 同步</h4>
+                          <p className="text-[10px] text-slate-400">跨设备 · 私有 · 免费</p>
+                        </div>
+                      </div>
+                      {gistSettings.token && (
+                        <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-1 rounded-full">已配置</span>
+                      )}
+                    </div>
+
+                    {!gistSettings.token ? (
+                      <div className="space-y-3">
+                        <p className="text-xs text-slate-500 leading-relaxed">
+                          创建一个只勾 <code className="px-1 py-0.5 bg-slate-100 rounded text-[10px]">gist</code> 权限的 Personal Access Token：
+                          <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noopener" className="text-orange-500 ml-1 underline">前往 GitHub 创建</a>
+                        </p>
+                        <div className="relative">
+                          <input
+                            type={showToken ? 'text' : 'password'}
+                            value={gistTokenInput}
+                            onChange={(e) => setGistTokenInput(e.target.value)}
+                            placeholder="ghp_... 或 github_pat_..."
+                            className="w-full bg-slate-50 p-3 pr-10 rounded-xl text-xs font-mono outline-none focus:ring-2 ring-orange-100 border border-slate-100"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowToken(!showToken)}
+                            className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-slate-400 hover:text-slate-600"
+                          >
+                            {showToken ? <EyeOff size={14}/> : <Eye size={14}/>}
+                          </button>
+                        </div>
+                        <button onClick={handleGistSaveToken} className="w-full py-3 rounded-xl bg-slate-900 text-white text-sm font-bold active:scale-95 transition-all">
+                          保存 Token
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="text-[10px] text-slate-400 space-y-1">
+                          {gistSettings.gistId && <div>Gist ID: <span className="font-mono text-slate-600">{gistSettings.gistId.slice(0, 12)}...</span></div>}
+                          {gistSettings.lastSyncTs && <div>上次同步: {new Date(gistSettings.lastSyncTs).toLocaleString('zh-CN')}</div>}
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            onClick={handleGistPush}
+                            disabled={gistBusy !== 'idle'}
+                            className="flex items-center justify-center gap-1.5 py-3 rounded-xl bg-blue-50 text-blue-600 text-xs font-bold disabled:opacity-50 active:scale-95 transition-all"
+                          >
+                            <CloudUpload size={14}/> {gistBusy === 'pushing' ? '上传中...' : '上传到云端'}
+                          </button>
+                          <button
+                            onClick={handleGistPull}
+                            disabled={gistBusy !== 'idle' || !gistSettings.gistId}
+                            className="flex items-center justify-center gap-1.5 py-3 rounded-xl bg-emerald-50 text-emerald-600 text-xs font-bold disabled:opacity-50 active:scale-95 transition-all"
+                          >
+                            <CloudDownload size={14}/> {gistBusy === 'pulling' ? '拉取中...' : '从云端恢复'}
+                          </button>
+                        </div>
+                        <button onClick={handleGistDisconnect} className="w-full text-[10px] text-slate-400 hover:text-red-500 py-1 transition-colors">
+                          断开连接
+                        </button>
+                      </div>
+                    )}
+
+                    {gistMessage && (
+                      <div className={`mt-3 px-3 py-2 rounded-lg text-xs font-bold ${gistMessage.kind === 'success' ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-600'}`}>
+                        {gistMessage.text}
+                      </div>
+                    )}
+                  </div>
+
+                  <button onClick={() => { if(window.confirm('确定要清空所有历史记录吗？此操作不可恢复！')) { localStorage.clear(); window.location.reload(); } }} className="w-full py-4 text-red-400 font-bold text-sm hover:bg-red-50 rounded-xl transition-colors">⚠ 重置所有数据</button>
+                </div>
             </div>
           ) : (
              <div className="space-y-4 pb-20"><div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm"><label className="text-xs font-bold text-slate-400 block mb-2 uppercase tracking-wider">计划名称</label><input value={plans[editingPlanId].name} onChange={(e) => updatePlanName(editingPlanId, e.target.value)} className="w-full text-xl font-black bg-transparent border-b-2 border-slate-100 pb-2 outline-none focus:border-orange-500 transition-colors" /></div><div className="md:grid md:grid-cols-2 md:gap-4 space-y-4 md:space-y-0">{plans[editingPlanId].exercises.map((ex, exIdx) => (<div key={ex.id} className="bg-white p-5 rounded-2xl border border-slate-100 relative group shadow-sm"><button onClick={() => deleteExercise(editingPlanId, ex.id)} className="absolute top-3 right-3 p-2 text-slate-300 hover:text-red-500 transition-colors"><X size={18}/></button><div className="grid grid-cols-12 gap-3 items-end"><div className="col-span-12 mb-2"><label className="text-[10px] font-bold text-slate-400 uppercase">动作名称</label><input value={ex.name} onChange={(e) => updateExercise(editingPlanId, exIdx, 'name', e.target.value)} className="w-full font-bold text-slate-800 bg-slate-50 p-3 rounded-xl mt-1 focus:ring-2 ring-orange-100 outline-none" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">组数</label><input type="text" inputMode="decimal" value={ex.sets} onChange={(e) => updateExercise(editingPlanId, exIdx, 'sets', parseInt(e.target.value))} className="w-full bg-slate-50 p-2 rounded-lg text-center font-bold" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">目标</label><input value={ex.defaultReps} onChange={(e) => updateExercise(editingPlanId, exIdx, 'defaultReps', e.target.value)} className="w-full bg-slate-50 p-2 rounded-lg text-center font-bold" /></div><div className="col-span-4"><label className="text-[10px] font-bold text-slate-400 uppercase">类型</label><select value={ex.unit} onChange={(e) => updateExercise(editingPlanId, exIdx, 'unit', e.target.value)} className="w-full bg-slate-50 p-2 rounded-lg text-xs font-bold appearance-none text-center"><option value="weight_reps">负重</option><option value="reps_only">自重</option><option value="time">计时</option></select></div></div></div>))}</div><button onClick={() => addExercise(editingPlanId)} className="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold hover:bg-slate-50 hover:text-slate-500 hover:border-slate-400 flex items-center justify-center gap-2 transition-all"><Plus size={20} /> 添加动作</button></div>
