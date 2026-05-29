@@ -30,7 +30,7 @@ function openDB(): Promise<IDBDatabase> {
   return dbPromise;
 }
 
-async function idbGet<T = unknown>(key: string): Promise<T | undefined> {
+export async function idbGet<T = unknown>(key: string): Promise<T | undefined> {
   try {
     const db = await openDB();
     return await new Promise<T | undefined>((resolve, reject) => {

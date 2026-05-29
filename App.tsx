@@ -20,7 +20,7 @@ import HistoryItem from './components/HistoryItem';
 import CalendarHeatmap from './components/CalendarHeatmap';
 import { haptics } from './lib/haptics';
 import { estimateSet, OneRMResult } from './lib/oneRepMax';
-import { saveWithMirror, recoverMissingKeys, runMigrations, daysSinceLastBackup, markBackupDone } from './lib/storage';
+import { saveWithMirror, recoverMissingKeys, runMigrations, daysSinceLastBackup, markBackupDone, idbGet } from './lib/storage';
 import * as gistSync from './lib/gistSync';
 
 export default function App() {
@@ -554,42 +554,104 @@ export default function App() {
     else { setPlans(MAIN_PLANS_DEFAULT); setCurrentPlanIndex(0); localStorage.setItem('fitness_plans_v8', JSON.stringify(MAIN_PLANS_DEFAULT)); localStorage.setItem('fitness_plan_index_v6', '0'); }
 
     // 状态保活：恢复进行中的训练（如果 PWA 被切后台杀掉重启）
+    // 优先从 IndexedDB 恢复（iOS 更可靠），fallback 到 localStorage
     try {
-      const savedActive = localStorage.getItem('fitness_active_workout_v1');
-      if (savedActive) {
-        const parsed = JSON.parse(savedActive);
-        if (parsed && parsed.activeWorkout && parsed.workoutStartTime) {
-          // 超过 6 小时没动的训练视为废弃，自动清理
-          const ageHours = (Date.now() - parsed.workoutStartTime) / 3600000;
-          if (ageHours < 6) {
-            setActiveWorkout(parsed.activeWorkout);
-            setWorkoutLogs(parsed.workoutLogs || {});
-            setWorkoutStartTime(parsed.workoutStartTime);
-            setExpandedExId(parsed.expandedExId || null);
-            setActiveTab('workout');
-          } else {
-            localStorage.removeItem('fitness_active_workout_v1');
-          }
+      let parsed: any = null;
+
+      // 先尝试从 IndexedDB 恢复
+      const idbState = await idbGet('fitness_active_workout_v1');
+      if (idbState) {
+        parsed = idbState;
+        console.log('[保活] 从 IndexedDB 恢复训练状态');
+      } else {
+        // fallback 到 localStorage
+        const savedActive = localStorage.getItem('fitness_active_workout_v1');
+        if (savedActive) {
+          parsed = JSON.parse(savedActive);
+          console.log('[保活] 从 localStorage 恢复训练状态');
         }
       }
-      } catch (e) { localStorage.removeItem('fitness_active_workout_v1'); }
+
+      if (parsed && parsed.activeWorkout && parsed.workoutStartTime) {
+        // 超过 6 小时没动的训练视为废弃，自动清理
+        const ageHours = (Date.now() - parsed.workoutStartTime) / 3600000;
+        if (ageHours < 6) {
+          setActiveWorkout(parsed.activeWorkout);
+          setWorkoutLogs(parsed.workoutLogs || {});
+          setWorkoutStartTime(parsed.workoutStartTime);
+          setExpandedExId(parsed.expandedExId || null);
+          setActiveTab('workout');
+          console.log('[保活] 训练状态已恢复，已进行', Math.floor(ageHours * 60), '分钟');
+        } else {
+          localStorage.removeItem('fitness_active_workout_v1');
+          console.log('[保活] 训练超过 6 小时，已废弃');
+        }
+      }
+    } catch (e) {
+      console.warn('[保活] 恢复失败:', e);
+      localStorage.removeItem('fitness_active_workout_v1');
+    }
     })();
   }, []);
 
-  // 状态保活：训练状态变化时自动写盘
-  useEffect(() => {
+  // 状态保活：训练状态变化时自动写盘 + IndexedDB 镜像
+  const saveActiveWorkoutState = () => {
     if (activeWorkout && workoutStartTime) {
       try {
-        localStorage.setItem('fitness_active_workout_v1', JSON.stringify({
+        const state = {
           activeWorkout,
           workoutLogs,
           workoutStartTime,
           expandedExId,
-        }));
+        };
+        localStorage.setItem('fitness_active_workout_v1', JSON.stringify(state));
+        // 同时写 IndexedDB 镜像（iOS 更可靠）
+        saveWithMirror('fitness_active_workout_v1', state);
       } catch (e) { /* 配额满了忽略，下次再试 */ }
     } else {
       localStorage.removeItem('fitness_active_workout_v1');
     }
+  };
+
+  useEffect(() => {
+    saveActiveWorkoutState();
+  }, [activeWorkout, workoutLogs, workoutStartTime, expandedExId]);
+
+  // 切屏保护：页面失焦时立即保存
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden && activeWorkout) {
+        console.log('[保活] 页面切后台，强制保存训练状态');
+        saveActiveWorkoutState();
+      }
+    };
+
+    const handlePageHide = () => {
+      if (activeWorkout) {
+        console.log('[保活] 页面即将卸载，强制保存训练状态');
+        saveActiveWorkoutState();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('beforeunload', handlePageHide);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('beforeunload', handlePageHide);
+    };
+  }, [activeWorkout, workoutLogs, workoutStartTime, expandedExId]);
+
+  // 定时自动保存：训练中每 30 秒保存一次（防止长时间无操作后切屏）
+  useEffect(() => {
+    if (!activeWorkout) return;
+    const interval = setInterval(() => {
+      console.log('[保活] 定时自动保存训练状态');
+      saveActiveWorkoutState();
+    }, 30000); // 30 秒
+    return () => clearInterval(interval);
   }, [activeWorkout, workoutLogs, workoutStartTime, expandedExId]);
 
   const saveToLocal = (key: string, data: any) => {
